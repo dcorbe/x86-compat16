@@ -47,9 +47,16 @@ result worth having.
    stub traps back out through a signal handler, which is also how the CPU's
    `CS` at fault time is captured.
 
-4. **espfix64** *(stretch)* — take an interrupt on a 16-bit stack segment and
-   see whether the upper 16 bits of `RSP` survive. This is the hazard that
-   forced the espfix64 workaround into the kernel in 2014.
+4. **`kernel_accepts_a_16bit_stack_descriptor`** — a writable 16-bit data
+   descriptor, suitable for loading into `SS`. Note it reads back with type
+   `0x3`, not the `0x2` the request implies: Linux sets the accessed bit itself
+   so the LDT page can be mapped read-only.
+
+5. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
+   with a 16-bit `SS` loaded and see what happens to `RSP` across the
+   `sigreturn`. This is a *characterisation* test: it records what the machine
+   actually does and fires if that changes. The result contradicted the
+   prediction; see below.
 
 ## Note on the execution test's design
 
@@ -83,6 +90,65 @@ far jump still entered the LDT segment, it was simply a 32-bit one.
 
 Worth making a permanent test rather than a one-off, which means threading the
 operand size through `compat16_install_code_segment()`.
+
+## Finding: the espfix64 hazard did not reproduce, and the prediction was wrong
+
+The setup here is different from the tests above: `CS` stays **64-bit** and it
+is `SS` that becomes a 16-bit LDT segment. Signal delivery therefore follows
+the ordinary path. The moment of interest is `sigreturn`, which restores the
+saved 16-bit `SS` and `IRET`s back to it.
+
+**Predicted, before measuring:** `IRET` to a stack segment with `B = 0` reloads
+only `SP`, so the low 16 bits of `RSP` survive and the upper bits arrive from
+whatever the kernel was running on — a fixed espfix alias address with
+espfix64, or the live kernel stack pointer without it.
+
+**Measured:**
+
+    rsp before      0x00007ffc3e70c900
+    rsp after       0x00007ffc3e70c900
+    ss saved        0x000f
+    ss in handler   0x000f
+
+`RSP` survives completely intact. No truncation, no leaked address. Two
+secondary surprises: `SS` was **not** reset to a flat segment for the duration
+of the handler — the handler ran with the 16-bit `SS` still loaded — and
+`ss_saved` confirms the 16-bit selector really was live across the whole round
+trip, so the test is not passing vacuously.
+
+**Control:** re-running with the stack descriptor's `B` bit *set* (an ordinary
+32-bit LDT stack segment) produces the same intact `RSP`. So in this
+configuration the `B` bit makes no observable difference at all.
+
+### What this does and does not establish
+
+It establishes that a 64-bit process can take and return from a signal with a
+16-bit `SS` loaded, and lose nothing.
+
+It does **not** establish that the espfix64 path was exercised. Nothing here
+observes the kernel taking that branch; the only evidence is that
+`CONFIG_X86_ESPFIX64=y` and that `SS` was an LDT selector. A transparent
+espfix64 and a never-taken espfix64 look identical from userspace.
+
+### The most likely explanation, untested
+
+`IRET`'s stack-pointer width follows the **operand size of the `IRET` itself**,
+not the new `SS`. The kernel returns with `IRETQ`, and this return lands on a
+64-bit `CS`, so a full 64-bit `RSP` is reloaded and the 16-bit `SS` never gets
+a chance to matter. On that reading the hazard needs the return to land in
+compatibility mode, with `CS` non-64-bit as well as `SS` 16-bit.
+
+That is a hypothesis. It has not been tested, and it should not be repeated as
+fact.
+
+### Next experiment
+
+Combine the two halves: 16-bit `CS` *and* 16-bit `SS`, then take a signal.
+Harder than it sounds, because the compatibility-mode signal finding below
+already shows delivery needs a `MAP_32BIT` alternate stack, and because
+resuming in 16-bit code after `sigreturn` needs its own way back out to
+64-bit — the probe above escapes by `siglongjmp`, which skips the `IRET` that
+is the entire subject of the experiment.
 
 ## Finding: you cannot take a signal on a 64-bit stack from compatibility mode
 

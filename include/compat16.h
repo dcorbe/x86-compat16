@@ -115,4 +115,29 @@ struct compat16_trap {
 int compat16_run_probe(int entry, void *segment_base, uint64_t seed,
                        struct compat16_trap *out);
 
+/* What a signal taken with a 16-bit stack segment does to RSP. */
+struct compat16_espfix {
+    uint64_t rsp_before;    /* RSP in 64-bit mode, before the trap */
+    uint64_t rsp_after;     /* RSP as sigreturn's IRET left it */
+    uint16_t ss_saved;      /* SS the kernel recorded in the signal frame */
+    uint16_t ss_in_handler; /* SS actually in effect inside the handler */
+};
+
+/*
+ * Take a signal while SS names the 16-bit stack segment in LDT slot
+ * `stack_entry`, and report what survives.
+ *
+ * CS stays 64-bit throughout, so signal delivery follows the ordinary path.
+ * The interesting instant is the return: sigreturn restores the saved 16-bit
+ * SS and IRETs to it.
+ *
+ * Measured result, which is NOT what was predicted: RSP survives completely
+ * intact, and the kernel leaves the 16-bit SS loaded while the handler runs
+ * rather than swapping in a flat one. README.md records the prediction, its
+ * falsification, and what remains unexplained.
+ *
+ * Returns 0 on success, -1 with errno set on failure to set up.
+ */
+int compat16_probe_espfix(int stack_entry, struct compat16_espfix *out);
+
 #endif /* COMPAT16_H */

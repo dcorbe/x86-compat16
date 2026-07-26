@@ -262,3 +262,77 @@ int compat16_run_probe(int entry, void *segment_base, uint64_t seed,
     out->signo = (int)probe_signo;
     return 0;
 }
+
+/*
+ * espfix probe state. File scope is load-bearing, not stylistic: between the
+ * IRET and the point where RSP is put back, there is no usable stack, so every
+ * operand in that window has to be reachable RIP-relatively.
+ */
+static uint64_t espfix_rsp_before;
+static uint64_t espfix_rsp_after;
+static volatile uint16_t espfix_frame_ss;
+static volatile uint16_t espfix_live_ss;
+
+static void espfix_handler(int signo, siginfo_t *info, void *ctx)
+{
+    const ucontext_t *uc = ctx;
+    uint16_t live;
+
+    (void)signo;
+    (void)info;
+
+    /* Same packed greg as CS, but SS occupies the top 16 bits. */
+    espfix_frame_ss = (uint16_t)(uc->uc_mcontext.gregs[REG_CSGSFS] >> 48);
+
+    __asm__ __volatile__("movw %%ss, %0" : "=r"(live));
+    espfix_live_ss = live;
+
+    /*
+     * Return normally. The return IS the experiment: sigreturn restores the
+     * saved 16-bit SS and IRETs to it. Recovering by siglongjmp here, as the
+     * other probe does, would skip the only instruction that matters.
+     */
+}
+
+int compat16_probe_espfix(int stack_entry, struct compat16_espfix *out)
+{
+    struct sigaction sa, saved;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = espfix_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGTRAP, &sa, &saved) != 0)
+        return -1;
+
+    uint16_t ss16 = COMPAT16_SELECTOR(stack_entry);
+    uint16_t ss64;
+    __asm__ __volatile__("movw %%ss, %0" : "=r"(ss64));
+
+    /*
+     * CS stays 64-bit for all of this, so the stack pointer in use is the full
+     * RSP and SS.B is ignored while we run. It matters only to IRET.
+     *
+     * The three instructions after int3 are a hazard window: RSP is truncated
+     * and any signal arriving before it is restored would push a frame at a
+     * garbage address. All three are RIP-relative or register-only for that
+     * reason, and the window is as short as it can be made.
+     */
+    __asm__ __volatile__("movq %%rsp, %[before]\n\t"
+                         "movw %[ss16], %%ss\n\t"
+                         "int3\n\t"
+                         "movq %%rsp, %[after]\n\t"
+                         "movw %[ss64], %%ss\n\t"
+                         "movq %[before], %%rsp"
+                         : [before] "=m"(espfix_rsp_before),
+                           [after] "=m"(espfix_rsp_after)
+                         : [ss16] "r"(ss16), [ss64] "r"(ss64)
+                         : "memory");
+
+    sigaction(SIGTRAP, &saved, NULL);
+
+    out->rsp_before = espfix_rsp_before;
+    out->rsp_after = espfix_rsp_after;
+    out->ss_saved = espfix_frame_ss;
+    out->ss_in_handler = espfix_live_ss;
+    return 0;
+}

@@ -156,13 +156,60 @@ TEST(kernel_accepts_a_16bit_stack_descriptor)
     ASSERT_EQ_INT(COMPAT16_DESC_TYPE(raw), COMPAT16_TYPE_DATA_RW_ACCESSED);
 }
 
+/*
+ * Taking a signal on a 16-bit stack segment. This is a characterisation test:
+ * it records measured behaviour, and it exists to fire if that behaviour ever
+ * changes.
+ *
+ * The prediction going in was that RSP would come back truncated -- IRET to a
+ * segment with B = 0 restoring only SP, upper bits supplied by espfix64. That
+ * is wrong, at least in this configuration. RSP survives in full. The
+ * prediction and what is still unexplained are written up in README.md.
+ *
+ * Asserting ss_saved matters as much as asserting RSP. Without it the test
+ * would pass trivially if the kernel quietly reset SS to a flat segment,
+ * measuring nothing.
+ */
+TEST(rsp_survives_a_signal_taken_on_a_16bit_stack_segment)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(compat16_install_stack_segment(TEST_LDT_STACK_ENTRY, page,
+                                                 SEGMENT_BYTES),
+                  0);
+
+    struct compat16_espfix fix = {0};
+    ASSERT_EQ_INT(compat16_probe_espfix(TEST_LDT_STACK_ENTRY, &fix), 0);
+
+    printf("        rsp before      %#018llx\n",
+           (unsigned long long)fix.rsp_before);
+    printf("        rsp after       %#018llx\n",
+           (unsigned long long)fix.rsp_after);
+    printf("        ss saved        %#06x\n", fix.ss_saved);
+    printf("        ss in handler   %#06x\n", fix.ss_in_handler);
+
+    /* The 16-bit stack segment really was in effect across the signal. */
+    ASSERT_EQ_INT(fix.ss_saved, COMPAT16_SELECTOR(TEST_LDT_STACK_ENTRY));
+
+    /* And RSP came back whole, upper bits and all. */
+    ASSERT_EQ_U64(fix.rsp_after, fix.rsp_before);
+}
+
 int main(void)
 {
+    /*
+     * Line buffering, so that partial results survive a crash. Earlier
+     * versions of this suite died mid-run and took their own output with
+     * them, which cost more time than it should have.
+     */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     printf("compat16: 16-bit protected mode on x86-64\n");
     RUN_TEST(kernel_accepts_a_16bit_code_descriptor);
     RUN_TEST(installed_descriptor_selects_16bit_compatibility_mode);
     RUN_TEST(far_jump_enters_the_16bit_code_segment);
     RUN_TEST(instructions_decode_with_16bit_default_operand_size);
     RUN_TEST(kernel_accepts_a_16bit_stack_descriptor);
+    RUN_TEST(rsp_survives_a_signal_taken_on_a_16bit_stack_segment);
     return harness_report();
 }
