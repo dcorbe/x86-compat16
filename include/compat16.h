@@ -59,10 +59,34 @@ int compat16_read_descriptor(int entry, uint64_t *out_raw);
 #define COMPAT16_DESC_D(raw) ((unsigned)(((raw) >> 54) & 1u))
 
 /*
+ * Segment type nibble, bits 40..43: accessed(40), writable(41),
+ * expand-down(42), executable(43).
+ *
+ * Note the accessed bit is already set on readback. Linux sets it itself when
+ * filling the descriptor rather than leaving it for the CPU to set on first
+ * load, so that the LDT page can be mapped read-only. A writable expand-up
+ * data segment therefore reads back as 0x3, not the 0x2 you would predict from
+ * the request alone.
+ */
+#define COMPAT16_DESC_TYPE(raw) ((unsigned)(((raw) >> 40) & 0xfu))
+#define COMPAT16_TYPE_DATA_RW_ACCESSED 0x3u
+
+/*
  * Build the segment selector naming LDT slot `entry` at user privilege:
  * index in bits 3..15, TI = 1 selects the LDT rather than the GDT, RPL = 3.
  */
 #define COMPAT16_SELECTOR(entry) ((uint16_t)(((unsigned)(entry) << 3) | 0x7u))
+
+/*
+ * Install a 16-bit writable data segment suitable for loading into SS.
+ *
+ * Same arguments and error convention as compat16_install_code_segment().
+ * Clearing seg_32bit here clears the descriptor's B bit rather than its D bit;
+ * the encoding is the same field, but for a stack segment it declares the
+ * stack pointer to be SP rather than ESP. That is the bit the whole espfix64
+ * problem hangs on.
+ */
+int compat16_install_stack_segment(int entry, const void *base, size_t length);
 
 /* CPU state captured at the instant the 16-bit probe trapped. */
 struct compat16_trap {

@@ -20,6 +20,7 @@
 #define LDT_WRITE 1
 
 /* struct user_desc .contents encoding. */
+#define DESC_CONTENTS_DATA 0
 #define DESC_CONTENTS_CODE 2
 
 int compat16_install_code_segment(int entry, const void *base, size_t length)
@@ -38,6 +39,32 @@ int compat16_install_code_segment(int entry, const void *base, size_t length)
         .contents = DESC_CONTENTS_CODE,
         .read_exec_only = 0, /* readable code segment */
         .limit_in_pages = 0, /* limit is in bytes */
+        .seg_not_present = 0,
+        .useable = 1,
+    };
+
+    if (syscall(SYS_modify_ldt, LDT_WRITE, &desc, sizeof(desc)) != 0)
+        return -1;
+
+    return 0;
+}
+
+int compat16_install_stack_segment(int entry, const void *base, size_t length)
+{
+    struct user_desc desc = {
+        .entry_number = (unsigned int)entry,
+        .base_addr = (unsigned int)(uintptr_t)base,
+        .limit = (unsigned int)(length - 1),
+
+        /*
+         * For a stack segment this field is the B bit: cleared, it declares
+         * the stack pointer to be SP rather than ESP.
+         */
+        .seg_32bit = 0,
+
+        .contents = DESC_CONTENTS_DATA,
+        .read_exec_only = 0, /* writable, which SS requires */
+        .limit_in_pages = 0,
         .seg_not_present = 0,
         .useable = 1,
     };

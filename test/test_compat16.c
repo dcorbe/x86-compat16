@@ -16,6 +16,9 @@
  */
 #define TEST_LDT_ENTRY 0
 
+/* A second slot, for the 16-bit stack segment the espfix64 probe loads. */
+#define TEST_LDT_STACK_ENTRY 1
+
 /*
  * Back the segment with one page. A 16-bit code segment cannot address more
  * than 64 KiB anyway, and the stub under test is a handful of bytes.
@@ -133,6 +136,26 @@ TEST(instructions_decode_with_16bit_default_operand_size)
     ASSERT_EQ_U64(trap.rax, PROBE_SEED_RESULT_16BIT);
 }
 
+/*
+ * The espfix64 hazard needs a 16-bit *stack* segment, which is a different
+ * descriptor from the code one: writable data, and the cleared bit is B rather
+ * than D. Gate the probe on the kernel accepting it.
+ */
+TEST(kernel_accepts_a_16bit_stack_descriptor)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(compat16_install_stack_segment(TEST_LDT_STACK_ENTRY, page,
+                                                 SEGMENT_BYTES),
+                  0);
+
+    uint64_t raw = 0;
+    ASSERT_EQ_INT(compat16_read_descriptor(TEST_LDT_STACK_ENTRY, &raw), 0);
+
+    ASSERT_EQ_INT(COMPAT16_DESC_D(raw), 0);
+    ASSERT_EQ_INT(COMPAT16_DESC_TYPE(raw), COMPAT16_TYPE_DATA_RW_ACCESSED);
+}
+
 int main(void)
 {
     printf("compat16: 16-bit protected mode on x86-64\n");
@@ -140,5 +163,6 @@ int main(void)
     RUN_TEST(installed_descriptor_selects_16bit_compatibility_mode);
     RUN_TEST(far_jump_enters_the_16bit_code_segment);
     RUN_TEST(instructions_decode_with_16bit_default_operand_size);
+    RUN_TEST(kernel_accepts_a_16bit_stack_descriptor);
     return harness_report();
 }
