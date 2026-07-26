@@ -105,6 +105,22 @@ static const int PROBE_SIGNALS[] = {SIGTRAP, SIGSEGV, SIGILL};
 static sigjmp_buf probe_recovery;
 static volatile sig_atomic_t probe_signo;
 static volatile uint16_t probe_cs;
+static volatile uint64_t probe_rax;
+
+/*
+ * The probe body, written into the segment at offset 0.
+ *
+ *   B8 34 12   read as 16-bit: mov ax, 0x1234   (3 bytes, AX only)
+ *              read as 32-bit: mov eax, imm32   (5 bytes, eats two INT3s
+ *                                                and zero-extends into RAX)
+ *   CC ...     INT3 padding. Deliberately long enough that the 32-bit
+ *              misreading also lands on one, so a wrong-mode CPU reports a
+ *              wrong value instead of running off into the page and dying
+ *              somewhere unhelpful.
+ */
+static const unsigned char PROBE_CODE[] = {
+    0xb8, 0x34, 0x12, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+};
 
 static void probe_trap_handler(int signo, siginfo_t *info, void *ctx)
 {
@@ -118,11 +134,12 @@ static void probe_trap_handler(int signo, siginfo_t *info, void *ctx)
      * greg, with CS in the low 16 bits.
      */
     probe_cs = (uint16_t)(uc->uc_mcontext.gregs[REG_CSGSFS] & 0xffffu);
+    probe_rax = (uint64_t)uc->uc_mcontext.gregs[REG_RAX];
 
     siglongjmp(probe_recovery, 1);
 }
 
-int compat16_run_probe(int entry, void *segment_base,
+int compat16_run_probe(int entry, void *segment_base, uint64_t seed,
                        struct compat16_trap *out)
 {
     /*
@@ -133,8 +150,7 @@ int compat16_run_probe(int entry, void *segment_base,
      */
     static struct sigaction saved[PROBE_SIGNAL_COUNT];
 
-    /* INT3 at offset 0: enter the segment and trap immediately. */
-    *(unsigned char *)segment_base = 0xcc;
+    memcpy(segment_base, PROBE_CODE, sizeof(PROBE_CODE));
 
     /*
      * The signal frame MUST live below 4 GiB, and this is not optional.
@@ -198,16 +214,24 @@ int compat16_run_probe(int entry, void *segment_base,
          * 64-bit mode, so the transition has to go through the indirect
          * memory form.
          */
-        __asm__ __volatile__("ljmpl *(%[target])"
-                             :
-                             : [target] "r"(&target)
-                             : "memory");
+        __asm__ __volatile__(
+            /*
+             * Seed RAX first: the whole point is what survives in the upper
+             * bits. Naming rax as a clobber also stops the compiler handing
+             * us rax as one of the input registers.
+             */
+            "movq %[seed], %%rax\n\t"
+            "ljmpl *(%[target])"
+            :
+            : [seed] "r"(seed), [target] "r"(&target)
+            : "rax", "memory");
     }
 
     for (size_t i = 0; i < PROBE_SIGNAL_COUNT; i++)
         sigaction(PROBE_SIGNALS[i], &saved[i], NULL);
 
     out->cs = probe_cs;
+    out->rax = probe_rax;
     out->signo = (int)probe_signo;
     return 0;
 }

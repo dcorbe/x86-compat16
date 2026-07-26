@@ -66,8 +66,9 @@ int compat16_read_descriptor(int entry, uint64_t *out_raw);
 
 /* CPU state captured at the instant the 16-bit probe trapped. */
 struct compat16_trap {
-    uint16_t cs; /* CS at fault time; proves which segment was executing */
-    int signo;   /* signal that ended the probe */
+    uint64_t rax; /* RAX at fault time; proves how the probe was decoded */
+    uint16_t cs;  /* CS at fault time; proves which segment was executing */
+    int signo;    /* signal that ended the probe */
 };
 
 /*
@@ -87,7 +88,7 @@ struct compat16_trap {
  *
  * Returns 0 on success. Returns -1 on failure to set up, with errno set.
  */
-int compat16_run_probe(int entry, void *segment_base,
+int compat16_run_probe(int entry, void *segment_base, uint64_t seed,
                        struct compat16_trap *out);
 
 #endif /* COMPAT16_H */

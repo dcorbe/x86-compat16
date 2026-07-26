@@ -59,6 +59,31 @@ probe sidesteps this by faulting deliberately and recovering through a signal
 handler, which runs in 64-bit mode and `siglongjmp`s out. The signal frame is a
 convenient bonus: it carries the register state at fault time, including `CS`.
 
+## Result
+
+All four tests pass on the environment above. A 64-bit process really does
+create a 16-bit protected-mode code segment, far-jump into it, and execute
+there, with the kernel in long mode the whole time and no hypervisor anywhere.
+
+### The negative control
+
+A test that always passes proves nothing, so the discriminator was checked by
+flipping `seg_32bit` to 1 and re-running. The decode test failed exactly as
+predicted:
+
+    installed_descriptor_selects_16bit_compatibility_mode
+        COMPAT16_DESC_D(raw): expected 0, got 1
+    instructions_decode_with_16bit_default_operand_size
+        trap.rax: expected 0xcafebabedead1234, got 0xcccc1234
+
+`0xcccc1234` is the 32-bit reading of the probe: `mov eax, 0xCCCC1234`, having
+eaten two of the `INT3` padding bytes as immediate data and zero-extended into
+`RAX`, destroying the upper half. The `CS` test still passed, correctly — the
+far jump still entered the LDT segment, it was simply a 32-bit one.
+
+Worth making a permanent test rather than a one-off, which means threading the
+operand size through `compat16_install_code_segment()`.
+
 ## Finding: you cannot take a signal on a 64-bit stack from compatibility mode
 
 This cost real debugging time and is the most interesting thing here.

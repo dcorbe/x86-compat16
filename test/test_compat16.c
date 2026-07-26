@@ -23,6 +23,15 @@
 #define SEGMENT_BYTES 4096
 
 /*
+ * RAX seed for the probe. Both halves carry distinctive bits so that a 32-bit
+ * misdecode, which zero-extends into RAX, cannot be mistaken for success.
+ */
+#define PROBE_SEED 0xCAFEBABEDEAD0000ull
+
+/* What a genuine 16-bit `mov ax, 0x1234` leaves behind: only AX changes. */
+#define PROBE_SEED_RESULT_16BIT 0xCAFEBABEDEAD1234ull
+
+/*
  * Allocate a page eligible to be a 16-bit segment base.
  *
  * MAP_32BIT is the point of this helper: a segment descriptor's base is a
@@ -86,9 +95,42 @@ TEST(far_jump_enters_the_16bit_code_segment)
         compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
 
     struct compat16_trap trap = {0};
-    ASSERT_EQ_INT(compat16_run_probe(TEST_LDT_ENTRY, page, &trap), 0);
+    ASSERT_EQ_INT(compat16_run_probe(TEST_LDT_ENTRY, page, PROBE_SEED, &trap),
+                  0);
 
     ASSERT_EQ_INT(trap.cs, COMPAT16_SELECTOR(TEST_LDT_ENTRY));
+}
+
+/*
+ * The one that actually settles it.
+ *
+ * Landing in the segment does not prove the CPU decoded 16-bit. The probe's
+ * three bytes B8 34 12 decode differently depending on the D bit, and the two
+ * readings disagree about how many bytes the instruction even is:
+ *
+ *   D = 0 (16-bit)   mov ax, 0x1234        3 bytes; writes AX only, so
+ *                                          RAX[63:16] survives untouched
+ *   D = 1 (32-bit)   mov eax, 0xCCCC1234   5 bytes; swallows two of the
+ *                                          following INT3 bytes as immediate
+ *                                          data, and zero-extends into RAX,
+ *                                          destroying RAX[63:32]
+ *
+ * Seeding RAX with a value that has bits set in both halves makes the two
+ * outcomes impossible to confuse. A CPU that quietly ran this as 32-bit code
+ * cannot produce the expected answer by accident.
+ */
+TEST(instructions_decode_with_16bit_default_operand_size)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    struct compat16_trap trap = {0};
+    ASSERT_EQ_INT(compat16_run_probe(TEST_LDT_ENTRY, page, PROBE_SEED, &trap),
+                  0);
+
+    ASSERT_EQ_U64(trap.rax, PROBE_SEED_RESULT_16BIT);
 }
 
 int main(void)
@@ -97,5 +139,6 @@ int main(void)
     RUN_TEST(kernel_accepts_a_16bit_code_descriptor);
     RUN_TEST(installed_descriptor_selects_16bit_compatibility_mode);
     RUN_TEST(far_jump_enters_the_16bit_code_segment);
+    RUN_TEST(instructions_decode_with_16bit_default_operand_size);
     return harness_report();
 }

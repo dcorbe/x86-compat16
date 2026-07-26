@@ -65,6 +65,15 @@ extern int harness_tests_run;
         ASSERT_MSG(a_ == e_, "%s: expected %lld, got %lld", #actual, e_, a_); \
     } while (0)
 
+/* Assert two 64-bit values are equal, reporting both in hex on mismatch. */
+#define ASSERT_EQ_U64(actual, expected)                                       \
+    do {                                                                      \
+        unsigned long long a_ = (unsigned long long)(actual);                 \
+        unsigned long long e_ = (unsigned long long)(expected);               \
+        ASSERT_MSG(a_ == e_, "%s: expected %#llx, got %#llx", #actual, e_,    \
+                   a_);                                                       \
+    } while (0)
+
 /*
  * Print the run summary. Returns a value suitable for main()'s exit status:
  * 0 when every test passed, 1 otherwise.
