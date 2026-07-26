@@ -53,9 +53,29 @@ TEST(kernel_accepts_a_16bit_code_descriptor)
     ASSERT_EQ_INT(rc, 0);
 }
 
+/*
+ * Acceptance is not agreement. The kernel could plausibly accept the request
+ * and store an ordinary 32-bit descriptor, in which case every later test
+ * would "pass" while measuring nothing. Read back what was actually stored.
+ */
+TEST(installed_descriptor_selects_16bit_compatibility_mode)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    uint64_t raw = 0;
+    ASSERT_EQ_INT(compat16_read_descriptor(TEST_LDT_ENTRY, &raw), 0);
+
+    ASSERT_EQ_INT(COMPAT16_DESC_D(raw), 0);
+    ASSERT_EQ_INT(COMPAT16_DESC_L(raw), 0);
+}
+
 int main(void)
 {
     printf("compat16: 16-bit protected mode on x86-64\n");
     RUN_TEST(kernel_accepts_a_16bit_code_descriptor);
+    RUN_TEST(installed_descriptor_selects_16bit_compatibility_mode);
     return harness_report();
 }

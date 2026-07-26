@@ -15,6 +15,7 @@
 #define COMPAT16_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * Install a 16-bit protected-mode code segment into this process's LDT.
@@ -32,5 +33,29 @@
  * a hardened system.
  */
 int compat16_install_code_segment(int entry, const void *base, size_t length);
+
+/*
+ * Read back the raw 8-byte segment descriptor sitting in LDT slot `entry`.
+ *
+ * Asking the kernel what it actually stored, rather than trusting what we
+ * asked it to store, is the only way to catch a request that was accepted but
+ * quietly normalised.
+ *
+ * Returns 0 on success and writes the descriptor to *out_raw. Returns -1 with
+ * errno set on failure.
+ */
+int compat16_read_descriptor(int entry, uint64_t *out_raw);
+
+/*
+ * Field accessors for a raw descriptor, by bit position:
+ *
+ *   bit 53  L    long-mode (64-bit) code segment
+ *   bit 54  D/B  default operand and address size, 1 = 32-bit, 0 = 16-bit
+ *
+ * 16-bit compatibility mode is exactly L = 0 together with D = 0. L = 1 with
+ * D = 0 would be a 64-bit code segment, and the two are only one bit apart.
+ */
+#define COMPAT16_DESC_L(raw) ((unsigned)(((raw) >> 53) & 1u))
+#define COMPAT16_DESC_D(raw) ((unsigned)(((raw) >> 54) & 1u))
 
 #endif /* COMPAT16_H */
