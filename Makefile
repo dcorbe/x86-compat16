@@ -6,7 +6,7 @@
 
 CC       ?= gcc
 CFLAGS   ?= -std=gnu11 -O0 -g -Wall -Wextra -Werror
-CPPFLAGS := -Iinclude -Itest
+CPPFLAGS := -Iinclude -Itest -D_GNU_SOURCE
 BUILD    := build
 BIN      := $(BUILD)/test_compat16
 

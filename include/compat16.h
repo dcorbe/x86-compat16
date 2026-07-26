@@ -58,4 +58,36 @@ int compat16_read_descriptor(int entry, uint64_t *out_raw);
 #define COMPAT16_DESC_L(raw) ((unsigned)(((raw) >> 53) & 1u))
 #define COMPAT16_DESC_D(raw) ((unsigned)(((raw) >> 54) & 1u))
 
+/*
+ * Build the segment selector naming LDT slot `entry` at user privilege:
+ * index in bits 3..15, TI = 1 selects the LDT rather than the GDT, RPL = 3.
+ */
+#define COMPAT16_SELECTOR(entry) ((uint16_t)(((unsigned)(entry) << 3) | 0x7u))
+
+/* CPU state captured at the instant the 16-bit probe trapped. */
+struct compat16_trap {
+    uint16_t cs; /* CS at fault time; proves which segment was executing */
+    int signo;   /* signal that ended the probe */
+};
+
+/*
+ * Far-jump into the 16-bit code segment in LDT slot `entry` and run a short
+ * probe there, recovering into *out when it traps.
+ *
+ * `segment_base` must be the same address the segment was installed over; the
+ * probe's instruction bytes are written into it.
+ *
+ * There is no far jump back. A 16-bit far jump cannot encode a 64-bit return
+ * target, so the probe deliberately traps instead and a signal handler running
+ * in 64-bit mode recovers via siglongjmp. The signal frame is a useful bonus:
+ * it carries the register state at fault time, including CS.
+ *
+ * Recovering this way requires an alternate signal stack below 4 GiB. That is
+ * not a detail -- without it the process dies. See the comment in compat16.c.
+ *
+ * Returns 0 on success. Returns -1 on failure to set up, with errno set.
+ */
+int compat16_run_probe(int entry, void *segment_base,
+                       struct compat16_trap *out);
+
 #endif /* COMPAT16_H */

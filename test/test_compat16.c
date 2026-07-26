@@ -72,10 +72,30 @@ TEST(installed_descriptor_selects_16bit_compatibility_mode)
     ASSERT_EQ_INT(COMPAT16_DESC_L(raw), 0);
 }
 
+/*
+ * The descriptor existing proves nothing about whether the CPU will honour a
+ * far jump to it from 64-bit mode. CS at fault time is the evidence: if it
+ * carries our LDT selector, the processor really was executing inside the
+ * 16-bit segment.
+ */
+TEST(far_jump_enters_the_16bit_code_segment)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    struct compat16_trap trap = {0};
+    ASSERT_EQ_INT(compat16_run_probe(TEST_LDT_ENTRY, page, &trap), 0);
+
+    ASSERT_EQ_INT(trap.cs, COMPAT16_SELECTOR(TEST_LDT_ENTRY));
+}
+
 int main(void)
 {
     printf("compat16: 16-bit protected mode on x86-64\n");
     RUN_TEST(kernel_accepts_a_16bit_code_descriptor);
     RUN_TEST(installed_descriptor_selects_16bit_compatibility_mode);
+    RUN_TEST(far_jump_enters_the_16bit_code_segment);
     return harness_report();
 }

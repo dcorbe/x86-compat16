@@ -55,7 +55,37 @@ result worth having.
 
 Returning to 64-bit code from a 16-bit segment by far jump is awkward: the
 return target is a 64-bit address that a 16-bit far jump cannot encode. The
-tests sidestep this the same way the kernel's own selftests do — the 16-bit
-stub faults deliberately, and a signal handler running in 64-bit mode recovers
-via `siglongjmp`. The signal frame is a convenient bonus: it carries the
-register state at fault time, including `CS`.
+probe sidesteps this by faulting deliberately and recovering through a signal
+handler, which runs in 64-bit mode and `siglongjmp`s out. The signal frame is a
+convenient bonus: it carries the register state at fault time, including `CS`.
+
+## Finding: you cannot take a signal on a 64-bit stack from compatibility mode
+
+This cost real debugging time and is the most interesting thing here.
+
+The first working version of the probe died with an **unhandled `SIGSEGV`
+despite having a `SIGSEGV` handler installed**, on a kernel with
+`CONFIG_IA32_EMULATION=y`. `strace` showed the shape:
+
+    --- SIGTRAP  {si_code=SI_KERNEL} ---     <- the int3 fired, so 16-bit
+                                                code really did execute
+    --- SIGSEGV  {si_code=SI_KERNEL} ---     <- frame setup failed
+    --- SIGSEGV  {si_code=SI_KERNEL} ---     <- and failed again
+    +++ killed by SIGSEGV +++
+
+That doubled kernel-generated `SIGSEGV` is the signature of `force_sigsegv()`:
+the kernel could not build a signal frame, tried to report *that* as a fault,
+and could not build a frame for it either.
+
+The cause is the frame's address. An ordinary x86-64 stack lives far above
+4 GiB, and while the CPU is in compatibility mode the kernel cannot place a
+frame there. Pointing the signal at a `MAP_32BIT` alternate stack — one
+variable changed — makes delivery work. That is the evidence; the exact kernel
+path enforcing it was not traced.
+
+It is the same family of hazard as espfix64: a 64-bit stack pointer meeting a
+stack discipline with only 32 bits to express it.
+
+**Consequence for the design:** fault-and-recover-via-signal is a valid way
+back out of 16-bit code, but *only* with a low alternate stack. Without one it
+is not merely unreliable, it is fatal.
