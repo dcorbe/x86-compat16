@@ -614,6 +614,84 @@ TEST(sigreturn_restores_the_16bit_stack)
     ASSERT_EQ_U64(run.rsi & 0xffffu, COMPAT16_STACK16_INITIAL_SP);
 }
 
+/*
+ * The last primitive: leave 16-bit code through a far call, and get back in
+ * where it left off.
+ *
+ * Every other excursion in this file enters 16-bit code at offset 0. That is
+ * fine for a probe and useless for servicing a call made *from* 16-bit code,
+ * which has to resume at an address nobody knew in advance. The 64-bit side
+ * here is told nothing: it reads the return CS:IP off the 16-bit stack, where
+ * the far CALL left it, and jumps back to that.
+ */
+TEST(a_far_call_leaves_a_usable_return_address_on_the_16bit_stack)
+{
+    void *code = map_low_page();
+    void *stack = map_low_page();
+    ASSERT_MSG(code != NULL && stack != NULL,
+               "could not map pages below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, code, SEGMENT_BYTES), 0);
+    ASSERT_EQ_INT(compat16_install_stack_segment(TEST_LDT_STACK_ENTRY, stack,
+                                                 SEGMENT_BYTES),
+                  0);
+
+    struct compat16_reentry run = {0};
+    ASSERT_EQ_INT(compat16_run_reentry(TEST_LDT_ENTRY, TEST_LDT_STACK_ENTRY,
+                                       code, stack, &run),
+                  0);
+
+    printf("        saved cs:ip     %#06x:%#06x\n", run.saved_cs, run.saved_ip);
+    printf("        sp at thunk     %#06x\n", run.sp_at_thunk);
+
+    ASSERT_MSG(run.signo == 0, "run abandoned on signal %d", run.signo);
+
+    /* The CALL pushed the instruction after itself, and its own segment. */
+    ASSERT_EQ_INT(run.saved_ip, COMPAT16_REENTRY_RESUME_IP);
+    ASSERT_EQ_INT(run.saved_cs, COMPAT16_SELECTOR(TEST_LDT_ENTRY));
+
+    /* Four bytes of frame: CS and IP, one word each. */
+    ASSERT_EQ_INT(run.sp_at_thunk, COMPAT16_STACK16_INITIAL_SP - 4);
+}
+
+/*
+ * And the half that matters: 64-bit code putting control back into 16-bit
+ * mode at that recovered address.
+ *
+ * The mark is set only at the resume point. Getting it back means the far jump
+ * landed on the instruction after the CALL and not somewhere else, and that SP
+ * was re-established with the call frame accounted for.
+ */
+TEST(sixteen_bit_code_resumes_at_a_recovered_cs_ip)
+{
+    void *code = map_low_page();
+    void *stack = map_low_page();
+    ASSERT_MSG(code != NULL && stack != NULL,
+               "could not map pages below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, code, SEGMENT_BYTES), 0);
+    ASSERT_EQ_INT(compat16_install_stack_segment(TEST_LDT_STACK_ENTRY, stack,
+                                                 SEGMENT_BYTES),
+                  0);
+
+    struct compat16_reentry run = {0};
+    ASSERT_EQ_INT(compat16_run_reentry(TEST_LDT_ENTRY, TEST_LDT_STACK_ENTRY,
+                                       code, stack, &run),
+                  0);
+
+    ASSERT_MSG(run.signo == 0, "run abandoned on signal %d", run.signo);
+
+    /* Execution resumed exactly at the recovered offset... */
+    ASSERT_EQ_U64(run.rcx & 0xffffu, COMPAT16_STACK16_CALL_MARK);
+
+    /* ...with the call frame gone, so the stack is back where it began. */
+    ASSERT_EQ_U64(run.rsi & 0xffffu, COMPAT16_STACK16_INITIAL_SP);
+
+    /* And the 64-bit caller's own stack is unharmed by either leg. */
+    ASSERT_EQ_INT(run.ss_after, run.ss_before);
+    ASSERT_EQ_U64(run.rsp_after, run.rsp_before);
+}
+
 int main(void)
 {
     /*
@@ -646,6 +724,8 @@ int main(void)
      * on trial, and a failure mode that kills the process outright would take
      * every result after it down too.
      */
+    RUN_TEST(a_far_call_leaves_a_usable_return_address_on_the_16bit_stack);
+    RUN_TEST(sixteen_bit_code_resumes_at_a_recovered_cs_ip);
     RUN_TEST(a_signal_can_be_taken_and_resumed_from_16bit_code);
     RUN_TEST(sigreturn_restores_the_16bit_stack);
     return harness_report();

@@ -1014,6 +1014,207 @@ int compat16_run_sigret(int code_entry, int stack_entry, void *code_base,
 }
 
 /*
+ * Layout of the re-entry experiment's code page. The thunk and the landing pad
+ * are given room of their own rather than being packed, so that the offsets
+ * baked into the stubs stay readable against a hex dump.
+ */
+#define REENTRY_THUNK_OFFSET 0x40
+#define REENTRY_LANDING_OFFSET 0x80
+
+/*
+ * The 16-bit code that calls out and is later resumed.
+ *
+ *      .code16
+ *   0: mov   $0x1234, %ax          b8 34 12
+ *   3: mov   $SS, %bx              bb ss ss    patched
+ *   6: mov   %bx, %ss              8e d3
+ *   8: mov   $0x1000, %sp          bc 00 10
+ *   b: lcall $CS, $0x40            9a 40 00 cs cs   selector patched
+ *  10: mov   $0xbeef, %cx          b9 ef be    <- THE RESUME POINT
+ *  13: mov   %sp, %si              89 e6
+ *  15: ljmpl $CS64, $LANDING       66 ea <off32> <sel16>   both patched
+ *
+ * Offset 0x10 is the whole experiment. The far CALL at 0x0b pushes it, the
+ * 64-bit side reads it back off the 16-bit stack, and re-entry has to land on
+ * it. Nothing tells the 64-bit side what that offset is -- it recovers it.
+ *
+ * The CALL's own target offset (0x40) is fixed and needs no patching, since
+ * the stub is installed at offset 0 of its segment. Its selector does.
+ */
+static unsigned char REENTRY_CODE[] = {
+    0xb8, 0x34, 0x12,                                /* mov  $0x1234, %ax  */
+    0xbb, 0x00, 0x00,                                /* mov  $SS, %bx      */
+    0x8e, 0xd3,                                      /* mov  %bx, %ss      */
+    0xbc, 0x00, 0x10,                                /* mov  $0x1000, %sp  */
+    0x9a, 0x40, 0x00, 0x00, 0x00,                    /* lcall $CS, $0x40   */
+    0xb9, 0xef, 0xbe,                                /* mov  $0xbeef, %cx  */
+    0x89, 0xe6,                                      /* mov  %sp, %si      */
+    0x66, 0xea, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* ljmpl $CS64, $pad  */
+};
+#define REENTRY_STACK_SELECTOR_FIELD 4
+#define REENTRY_CALL_SELECTOR_FIELD 14
+#define REENTRY_JMP_OFFSET_FIELD 23
+#define REENTRY_JMP_SELECTOR_FIELD 27
+
+/*
+ * The thunk. All it does is leave, which is all a real import thunk does once
+ * it has identified itself -- the work happens on the 64-bit side.
+ *
+ *   0: ljmpl $CS64, $LANDING       66 ea <off32> <sel16>
+ */
+static unsigned char REENTRY_THUNK[] = {
+    0x66, 0xea, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+#define REENTRY_THUNK_OFFSET_FIELD 2
+#define REENTRY_THUNK_SELECTOR_FIELD 6
+
+int compat16_run_reentry(int code_entry, int stack_entry, void *code_base,
+                         void *stack_base, struct compat16_reentry *out)
+{
+    static struct sigaction saved[PROBE_SIGNAL_COUNT];
+
+    unsigned char *page = code_base;
+    unsigned char *landing = page + REENTRY_LANDING_OFFSET;
+
+    if ((uintptr_t)landing > UINT32_MAX) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    uint16_t cs64;
+    __asm__ __volatile__("movw %%cs, %0" : "=r"(cs64));
+
+    uint16_t code_sel = COMPAT16_SELECTOR(code_entry);
+    uint16_t stack_sel = COMPAT16_SELECTOR(stack_entry);
+    uint32_t landing_linear = (uint32_t)(uintptr_t)landing;
+
+    memcpy(REENTRY_CODE + REENTRY_STACK_SELECTOR_FIELD, &stack_sel,
+           sizeof(stack_sel));
+    memcpy(REENTRY_CODE + REENTRY_CALL_SELECTOR_FIELD, &code_sel,
+           sizeof(code_sel));
+    memcpy(REENTRY_CODE + REENTRY_JMP_OFFSET_FIELD, &landing_linear,
+           sizeof(landing_linear));
+    memcpy(REENTRY_CODE + REENTRY_JMP_SELECTOR_FIELD, &cs64, sizeof(cs64));
+    memcpy(REENTRY_THUNK + REENTRY_THUNK_OFFSET_FIELD, &landing_linear,
+           sizeof(landing_linear));
+    memcpy(REENTRY_THUNK + REENTRY_THUNK_SELECTOR_FIELD, &cs64, sizeof(cs64));
+
+    memcpy(page, REENTRY_CODE, sizeof(REENTRY_CODE));
+    memcpy(page + REENTRY_THUNK_OFFSET, REENTRY_THUNK, sizeof(REENTRY_THUNK));
+    memcpy(landing, STACK16_LANDING, sizeof(STACK16_LANDING));
+
+    if (probe_altstack_install() != 0)
+        return -1;
+    if (probe_signals_install(saved) != 0)
+        return -1;
+
+    probe_signo = 0;
+    memset(stack16_slots, 0, sizeof(stack16_slots));
+    stack16_rsp_before = 0;
+    stack16_rsp_after = 0;
+    stack16_ss_before = 0;
+    stack16_ss_after = 0;
+
+    struct far_ptr outbound = {
+        .offset = 0,
+        .selector = code_sel,
+    };
+
+    /* Leg one: in at offset 0, out through the thunk. */
+    if (sigsetjmp(probe_recovery, 1) == 0) {
+        __asm__ __volatile__(
+            "movq %%rsp, %[rsp_before]\n\t"
+            "movw %%ss, %[ss_before]\n\t"
+            "leaq 1f(%%rip), %%r11\n\t"
+            "xorl %%r13d, %%r13d\n\t"
+            "movw %%ss, %%r13w\n\t"
+            "movq %[slots], %%r14\n\t"
+            "movq %%rsp, %%r15\n\t"
+            "ljmpl *(%[target])\n"
+            "1:"
+            : [rsp_before] "=m"(stack16_rsp_before),
+              [ss_before] "=m"(stack16_ss_before)
+            : [target] "r"(&outbound), [slots] "r"(stack16_slots)
+            : "rax", "rcx", "rdx", "rsi", "r10", "r11", "r13", "r14", "r15",
+              "memory");
+    }
+
+    if (probe_signo != 0)
+        goto done;
+
+    /*
+     * Recover the return address from the 16-bit stack.
+     *
+     * A 16-bit far CALL pushes CS first, then IP, so IP sits at the lower
+     * address. SP came back in the landing pad's spill; the segment base is
+     * `stack_base`, and the two together give a plain pointer.
+     */
+    uint16_t sp_at_thunk = (uint16_t)(stack16_slots[STACK16_SLOT_RSP] & 0xffffu);
+    const unsigned char *frame = (const unsigned char *)stack_base + sp_at_thunk;
+
+    uint16_t saved_ip, saved_cs;
+    memcpy(&saved_ip, frame, sizeof(saved_ip));
+    memcpy(&saved_cs, frame + sizeof(saved_ip), sizeof(saved_cs));
+
+    out->sp_at_thunk = sp_at_thunk;
+    out->saved_ip = saved_ip;
+    out->saved_cs = saved_cs;
+
+    struct far_ptr inbound = {
+        .offset = saved_ip,
+        .selector = saved_cs,
+    };
+
+    /*
+     * Leg two: back in at the address the CALL left behind, with the call
+     * frame accounted for -- SP moves up by the four bytes CS:IP occupied,
+     * which is what the far RET this stands in for would have done.
+     */
+    uint64_t resume_sp = (uint64_t)sp_at_thunk + 4u;
+
+    if (sigsetjmp(probe_recovery, 1) == 0) {
+        __asm__ __volatile__(
+            "leaq 1f(%%rip), %%r11\n\t"
+            "xorl %%r13d, %%r13d\n\t"
+            "movw %%ss, %%r13w\n\t"
+            "movq %[slots], %%r14\n\t"
+            "movq %%rsp, %%r15\n\t"
+
+            /*
+             * SS and the stack pointer, paired inside MOV SS's interrupt
+             * shadow. RSP takes the segment offset, not a linear address:
+             * 16-bit mode reads only its low 16 bits and adds the descriptor's
+             * base itself.
+             */
+            "movw %[ss16], %%ss\n\t"
+            "movq %[sp], %%rsp\n\t"
+
+            "ljmpl *(%[target])\n"
+            "1:\n\t"
+            "movq %%rsp, %[rsp_after]\n\t"
+            "movw %%ss, %[ss_after]"
+            : [rsp_after] "=m"(stack16_rsp_after),
+              [ss_after] "=m"(stack16_ss_after)
+            : [target] "r"(&inbound), [slots] "r"(stack16_slots),
+              [ss16] "r"(stack_sel), [sp] "r"(resume_sp)
+            : "rax", "rcx", "rdx", "rsi", "r10", "r11", "r13", "r14", "r15",
+              "memory");
+    }
+
+done:
+    probe_signals_restore(saved);
+
+    out->rcx = stack16_slots[STACK16_SLOT_RCX];
+    out->rsi = stack16_slots[STACK16_SLOT_RSI];
+    out->rsp_before = stack16_rsp_before;
+    out->rsp_after = stack16_rsp_after;
+    out->ss_before = stack16_ss_before;
+    out->ss_after = stack16_ss_after;
+    out->signo = (int)probe_signo;
+    return 0;
+}
+
+/*
  * espfix probe state. File scope is load-bearing, not stylistic: between the
  * IRET and the point where RSP is put back, there is no usable stack, so every
  * operand in that window has to be reachable RIP-relatively.

@@ -315,6 +315,64 @@ struct compat16_sigret {
 int compat16_run_sigret(int code_entry, int stack_entry, void *code_base,
                         void *stack_base, struct compat16_sigret *out);
 
+/*
+ * Fixed offsets within the re-entry stub's code segment: where the thunk sits,
+ * and the instruction the far CALL to it will return to. The second is what a
+ * successful re-entry has to land on, and what the far CALL should have left
+ * on the 16-bit stack.
+ */
+#define COMPAT16_REENTRY_THUNK_IP 0x0040u
+#define COMPAT16_REENTRY_RESUME_IP 0x0010u
+
+/* What a 64-bit caller can recover, and then resume, from a 16-bit far call. */
+struct compat16_reentry {
+    /* Read off the 16-bit stack after the outbound leg. */
+    uint16_t saved_ip;    /* return offset the far CALL pushed */
+    uint16_t saved_cs;    /* and the selector beside it */
+    uint16_t sp_at_thunk; /* SP once the CALL had pushed both */
+
+    /* Observed after 64-bit code re-entered at that saved CS:IP. */
+    uint64_t rcx; /* the mark set at the resume point */
+    uint64_t rsi; /* SP after resuming; the frame should be gone */
+
+    uint64_t rsp_before;
+    uint64_t rsp_after;
+    uint16_t ss_before;
+    uint16_t ss_after;
+
+    int signo; /* non-zero only if the run had to be abandoned */
+};
+
+/*
+ * Leave 16-bit code through a far call, then re-enter it where it left off.
+ *
+ * The last primitive a host needs, and the one every other excursion here
+ * ducks: they all enter 16-bit code at a fixed offset. Servicing a call made
+ * *from* 16-bit code means resuming it at an address nobody knew in advance.
+ *
+ * The shape mirrors what a real import thunk does:
+ *
+ *   1. 16-bit code far-CALLs a thunk, which puts CS:IP on the 16-bit stack.
+ *   2. The thunk far-jumps out to 64-bit mode.
+ *   3. The 64-bit side reads that CS:IP straight off the 16-bit stack -- it
+ *      knows the segment's base and has SP from the landing pad.
+ *   4. It re-enters 16-bit mode there, having put SS and SP back, with the
+ *      call frame accounted for.
+ *
+ * Step 4 needs no new instruction: it is the same indirect far jump used to
+ * enter 16-bit mode anywhere else, with the offset taken from the stack rather
+ * than fixed at zero. What it does need is care with the stack pointer. SS is
+ * loaded first and RSP immediately after, inside MOV SS's interrupt shadow, and
+ * RSP is set to the *segment offset* rather than a linear address: in 16-bit
+ * mode only its low 16 bits are consulted, and the base comes from the
+ * descriptor. Setting a linear address there would work only when the segment
+ * happens to be 64 KiB aligned.
+ *
+ * Returns 0 on success. Returns -1 with errno set on failure to set up.
+ */
+int compat16_run_reentry(int code_entry, int stack_entry, void *code_base,
+                         void *stack_base, struct compat16_reentry *out);
+
 /* What a signal taken with a 16-bit stack segment does to RSP. */
 struct compat16_espfix {
     uint64_t rsp_before;    /* RSP in 64-bit mode, before the trap */

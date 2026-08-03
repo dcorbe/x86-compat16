@@ -81,12 +81,17 @@ result worth having.
    pushes and pops, and far-calls a subroutine so that `CS:IP` goes on that
    stack and `RETF` brings it back.
 
-9. **`a_signal_can_be_taken_and_resumed_from_16bit_code`** and
+9. **`a_far_call_leaves_a_usable_return_address_on_the_16bit_stack`** and
+   **`sixteen_bit_code_resumes_at_a_recovered_cs_ip`** — leaving 16-bit code
+   through a far call and getting back in where it left off, at an address the
+   64-bit side recovers from the stack rather than being told.
+
+10. **`a_signal_can_be_taken_and_resumed_from_16bit_code`** and
    **`sigreturn_restores_the_16bit_stack`** — the configuration espfix64 exists
    for: `CS` and `SS` both 16-bit when the signal lands. The handler *returns*
    rather than escaping, so that `sigreturn`'s `IRET` is the thing on trial.
 
-10. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
+11. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
    with a 16-bit `SS` loaded and see what happens to `RSP` across the
    `sigreturn`. This is a *characterisation* test: it records what the machine
    actually does and fires if that changes. The result contradicted the
@@ -541,3 +546,73 @@ one place that matters is the handful of instructions where `SS` and `SP`
 disagree, which `MOV SS`'s interrupt shadow already covers. And this says
 nothing about a signal whose handler wants to *do* something in 16-bit context —
 it only establishes that an interruption is transparent.
+
+## Finding: 16-bit code can be resumed at an address it was never told
+
+Every other excursion in this file enters 16-bit code at offset 0. That is fine
+for a probe and useless for servicing a call made *from* 16-bit code, which has
+to resume at an address nobody knew in advance.
+
+The shape here mirrors a real import thunk:
+
+```
+        .code16
+   0:   mov   $0x1234, %ax
+        ... load the 16-bit SS, set SP ...
+   b:   lcall $CS, $0x40         # into the thunk; pushes CS:IP
+  10:   mov   $0xbeef, %cx       # <- THE RESUME POINT
+  13:   mov   %sp, %si
+  15:   ljmpl $CS64, $landing
+```
+
+The thunk does nothing but far-jump out to 64-bit mode. The 64-bit side is told
+nothing about offset `0x10`: it reads the return `CS:IP` off the 16-bit stack,
+where the far `CALL` left it, and jumps back to that.
+
+**Measured:**
+
+    saved cs:ip     0x0007:0x0010
+    sp at thunk     0x0ffc
+
+Both recovered, not supplied. `SP` is four below where it started — `CS` and
+`IP`, one word each. Re-entry lands on `0x10`, `CX` comes back `0xbeef`, `SI`
+comes back `0x1000` with the call frame gone, and the 64-bit caller's own `SS`
+and `RSP` are untouched by either leg.
+
+Re-entry needs no new instruction. It is the same indirect far jump used to
+enter 16-bit mode anywhere else, with the offset taken from the stack instead of
+fixed at zero.
+
+### The one place this is easy to get wrong
+
+`RSP` must be set to the **segment offset**, not a linear address. In 16-bit
+mode only its low 16 bits are consulted, and the descriptor supplies the base.
+
+Writing a linear address there is the obvious mistake, and it *sometimes works*
+— exactly when the segment happens to start on a 64 KiB boundary, because only
+then do the low 16 bits of `base + offset` equal `offset`. Six consecutive
+`MAP_32BIT` mappings on this machine:
+
+    0x40846000  low16=0x6000
+    0x4197c000  low16=0xc000
+    0x41985000  low16=0x5000
+    0x41590000  low16=0x0000   <- would have worked
+    0x40c39000  low16=0x9000
+    0x40f28000  low16=0x8000
+
+Page-aligned, essentially never 64 KiB-aligned. A stack pointer built that way
+would come out wrong around fifteen times in sixteen, and right the other time,
+which is a far worse failure than one that never works at all. Either use the
+segment offset, as here, or allocate 16-bit stack segments 64 KiB aligned and
+know that you are relying on it.
+
+### The negative control
+
+| Mutation | Failures |
+| --- | --- |
+| resume one byte past the saved `IP` | both |
+| ignore the call frame when restoring `SP` | the resume test only |
+| set `RSP` to a linear address | the resume test only |
+
+The third is the mutation that matters: it is the plausible mistake, it fails
+here, and the table above explains why it would not always fail elsewhere.
