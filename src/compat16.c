@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/ucontext.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "compat16.h"
@@ -393,11 +394,62 @@ static uint64_t roundtrip_rsp_at_landing;
 static uint64_t roundtrip_rsp_after;
 static uint16_t roundtrip_cs_after;
 
-int compat16_run_roundtrip(int entry, void *segment_base, uint64_t seed,
-                           struct compat16_roundtrip *out)
+/*
+ * One complete excursion: far jump out to the 16-bit stub, and back through the
+ * landing pad. Results land in the roundtrip_* statics.
+ *
+ * Extracted so the probe and the timing loop run the identical instruction
+ * sequence -- a benchmark measuring something subtly different from what the
+ * tests verify would be worse than no benchmark.
+ *
+ * There is no sigsetjmp() here. A fault during the excursion longjmps to
+ * whatever recovery point the caller established, abandoning this frame, which
+ * is what should happen: a faulted transition invalidates the whole run.
+ */
+static void roundtrip_transition(const struct far_ptr *target, uint64_t seed)
 {
-    static struct sigaction saved[PROBE_SIGNAL_COUNT];
+    /*
+     * Out and back, with no kernel involvement anywhere in between.
+     *
+     * The three registers the landing pad needs are loaded before the jump,
+     * because after it there is no way to load them: compatibility mode cannot
+     * name r8-r15, and that inaccessibility is exactly what keeps their
+     * contents safe.
+     *
+     * R10 is zeroed rather than left alone so that a landing pad which never
+     * ran reports zero instead of a stale value.
+     */
+    __asm__ __volatile__(
+        "movq %%rsp, %[rsp_before]\n\t"
+        "movq %[seed], %%rax\n\t"
+        "xorl %%r10d, %%r10d\n\t"
+        "leaq 1f(%%rip), %%r11\n\t"
+        "movq %[landing_slot], %%r14\n\t"
+        "movq %%rsp, %%r15\n\t"
+        "ljmpl *(%[target])\n"
+        "1:\n\t"
+        "movq %%rsp, %[rsp_after]\n\t"
+        "movq %%rax, %[rax]\n\t"
+        "movq %%r10, %[r10]\n\t"
+        "movw %%cs, %[cs_after]"
+        : [rsp_before] "=m"(roundtrip_rsp_before),
+          [rsp_after] "=m"(roundtrip_rsp_after), [rax] "=m"(roundtrip_rax),
+          [r10] "=m"(roundtrip_r10), [cs_after] "=m"(roundtrip_cs_after)
+        : [seed] "r"(seed), [target] "r"(target),
+          [landing_slot] "r"(&roundtrip_rsp_at_landing)
+        : "rax", "r10", "r11", "r14", "r15", "memory");
+}
 
+/*
+ * Write both stubs into the page and patch the outbound far jump's target.
+ *
+ * Neither the landing pad's address nor the 64-bit CS selector is knowable
+ * until run time, which is why ROUNDTRIP_CODE16 is not const.
+ *
+ * Returns the 64-bit CS selector on success, 0 on failure with errno set.
+ */
+static uint16_t roundtrip_stubs_install(void *segment_base)
+{
     unsigned char *page = segment_base;
     unsigned char *landing = page + ROUNDTRIP_LANDING_OFFSET;
 
@@ -408,7 +460,7 @@ int compat16_run_roundtrip(int entry, void *segment_base, uint64_t seed,
      */
     if ((uintptr_t)landing > UINT32_MAX) {
         errno = EFAULT;
-        return -1;
+        return 0;
     }
 
     /*
@@ -426,6 +478,18 @@ int compat16_run_roundtrip(int entry, void *segment_base, uint64_t seed,
            sizeof(cs64));
     memcpy(page, ROUNDTRIP_CODE16, sizeof(ROUNDTRIP_CODE16));
     memcpy(landing, ROUNDTRIP_CODE64, sizeof(ROUNDTRIP_CODE64));
+
+    return cs64;
+}
+
+int compat16_run_roundtrip(int entry, void *segment_base, uint64_t seed,
+                           struct compat16_roundtrip *out)
+{
+    static struct sigaction saved[PROBE_SIGNAL_COUNT];
+
+    uint16_t cs64 = roundtrip_stubs_install(segment_base);
+    if (cs64 == 0)
+        return -1;
 
     if (probe_altstack_install() != 0)
         return -1;
@@ -445,38 +509,8 @@ int compat16_run_roundtrip(int entry, void *segment_base, uint64_t seed,
         .selector = COMPAT16_SELECTOR(entry),
     };
 
-    if (sigsetjmp(probe_recovery, 1) == 0) {
-        /*
-         * Out and back, with no kernel involvement anywhere in between.
-         *
-         * The three registers the landing pad needs are loaded before the jump,
-         * because after it there is no way to load them: compatibility mode
-         * cannot name r8-r15, and that inaccessibility is exactly what keeps
-         * their contents safe.
-         *
-         * R10 is zeroed rather than left alone so that a landing pad which
-         * never ran reports zero instead of a stale value.
-         */
-        __asm__ __volatile__(
-            "movq %%rsp, %[rsp_before]\n\t"
-            "movq %[seed], %%rax\n\t"
-            "xorl %%r10d, %%r10d\n\t"
-            "leaq 1f(%%rip), %%r11\n\t"
-            "movq %[landing_slot], %%r14\n\t"
-            "movq %%rsp, %%r15\n\t"
-            "ljmpl *(%[target])\n"
-            "1:\n\t"
-            "movq %%rsp, %[rsp_after]\n\t"
-            "movq %%rax, %[rax]\n\t"
-            "movq %%r10, %[r10]\n\t"
-            "movw %%cs, %[cs_after]"
-            : [rsp_before] "=m"(roundtrip_rsp_before),
-              [rsp_after] "=m"(roundtrip_rsp_after), [rax] "=m"(roundtrip_rax),
-              [r10] "=m"(roundtrip_r10), [cs_after] "=m"(roundtrip_cs_after)
-            : [seed] "r"(seed), [target] "r"(&target),
-              [landing_slot] "r"(&roundtrip_rsp_at_landing)
-            : "rax", "r10", "r11", "r14", "r15", "memory");
-    }
+    if (sigsetjmp(probe_recovery, 1) == 0)
+        roundtrip_transition(&target, seed);
 
     probe_signals_restore(saved);
 
@@ -488,6 +522,113 @@ int compat16_run_roundtrip(int entry, void *segment_base, uint64_t seed,
     out->cs_before = cs64;
     out->cs_after = roundtrip_cs_after;
     out->signo = (int)probe_signo;
+    return 0;
+}
+
+/*
+ * Excursions run before the clock starts, to fault in the pages, load the
+ * descriptor into the CPU's segment cache and settle the branch predictors.
+ * The first transition is markedly more expensive than the rest, and timing it
+ * would say more about cold caches than about the transition.
+ */
+#define COST_WARMUP 1000
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+int compat16_time_roundtrip(int entry, void *segment_base, uint64_t iterations,
+                            uint64_t *out_ns)
+{
+    static struct sigaction saved[PROBE_SIGNAL_COUNT];
+
+    if (roundtrip_stubs_install(segment_base) == 0)
+        return -1;
+    if (probe_altstack_install() != 0)
+        return -1;
+    if (probe_signals_install(saved) != 0)
+        return -1;
+
+    struct far_ptr target = {
+        .offset = 0,
+        .selector = COMPAT16_SELECTOR(entry),
+    };
+
+    /*
+     * The recovery point exists only to catch a faulted excursion. Landing here
+     * means the run is void: report the failure rather than a timing derived
+     * from an unknown number of completed iterations.
+     */
+    if (sigsetjmp(probe_recovery, 1) != 0) {
+        probe_signals_restore(saved);
+        errno = EIO;
+        return -1;
+    }
+
+    for (uint64_t i = 0; i < COST_WARMUP; i++)
+        roundtrip_transition(&target, 0);
+
+    uint64_t start = monotonic_ns();
+    for (uint64_t i = 0; i < iterations; i++)
+        roundtrip_transition(&target, 0);
+    uint64_t elapsed = monotonic_ns() - start;
+
+    probe_signals_restore(saved);
+
+    *out_ns = elapsed;
+    return 0;
+}
+
+/*
+ * One excursion by the other route: far jump out, trap, and let the handler
+ * recover.
+ *
+ * The sigsetjmp() sits inside this function rather than in the loop above it so
+ * that recovery unwinds exactly one iteration. Put it outside and the handler's
+ * siglongjmp would abandon the loop counter along with the frame.
+ */
+static void signal_transition(const struct far_ptr *target)
+{
+    if (sigsetjmp(probe_recovery, 1) == 0) {
+        __asm__ __volatile__("ljmpl *(%[target])"
+                             :
+                             : [target] "r"(target)
+                             : "memory");
+    }
+}
+
+int compat16_time_signal_path(int entry, void *segment_base,
+                              uint64_t iterations, uint64_t *out_ns)
+{
+    static struct sigaction saved[PROBE_SIGNAL_COUNT];
+
+    memcpy(segment_base, PROBE_CODE, sizeof(PROBE_CODE));
+
+    if (probe_altstack_install() != 0)
+        return -1;
+    if (probe_signals_install(saved) != 0)
+        return -1;
+
+    struct far_ptr target = {
+        .offset = 0,
+        .selector = COMPAT16_SELECTOR(entry),
+    };
+
+    for (uint64_t i = 0; i < COST_WARMUP; i++)
+        signal_transition(&target);
+
+    uint64_t start = monotonic_ns();
+    for (uint64_t i = 0; i < iterations; i++)
+        signal_transition(&target);
+    uint64_t elapsed = monotonic_ns() - start;
+
+    probe_signals_restore(saved);
+
+    *out_ns = elapsed;
     return 0;
 }
 

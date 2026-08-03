@@ -175,6 +175,40 @@ struct compat16_roundtrip {
 int compat16_run_roundtrip(int entry, void *segment_base, uint64_t seed,
                            struct compat16_roundtrip *out);
 
+/*
+ * Time `iterations` complete far-jump excursions into 16-bit mode and back,
+ * writing the total elapsed nanoseconds to *out_ns.
+ *
+ * Setup -- stub installation, alternate stack, signal handlers -- happens once,
+ * outside the clock, so what is measured is the transition and nothing else. A
+ * warmup pass runs first, also outside the clock.
+ *
+ * The figure includes the trampoline's bookkeeping stores and one ordinary
+ * function call per iteration. Both are noise beside a mode transition, and
+ * counting them errs in the honest direction.
+ *
+ * Returns 0 on success. Returns -1 with errno set on failure to set up, or
+ * EIO if any excursion faulted, in which case the timing means nothing and is
+ * not reported.
+ */
+int compat16_time_roundtrip(int entry, void *segment_base, uint64_t iterations,
+                            uint64_t *out_ns);
+
+/*
+ * The same measurement for the other way home: far jump out, trap deliberately,
+ * and let the signal handler recover by siglongjmp. Same setup-once discipline,
+ * same units.
+ *
+ * Note this times the recovery path exactly as compat16_run_probe() implements
+ * it, including sigsetjmp() saving the signal mask -- a further syscall per
+ * iteration. A signal-based host could shave that off. It could not shave off
+ * the signal delivery itself, which is the cost that matters.
+ *
+ * Returns 0 on success, -1 with errno set on failure.
+ */
+int compat16_time_signal_path(int entry, void *segment_base,
+                              uint64_t iterations, uint64_t *out_ns);
+
 /* What a signal taken with a 16-bit stack segment does to RSP. */
 struct compat16_espfix {
     uint64_t rsp_before;    /* RSP in 64-bit mode, before the trap */

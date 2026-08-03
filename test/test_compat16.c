@@ -280,6 +280,57 @@ TEST(the_landing_pad_hands_back_an_intact_rsp)
 }
 
 /*
+ * How many excursions to time. Large enough that the signal path's cost swamps
+ * clock granularity, small enough that the suite still finishes promptly: the
+ * signal path dominates the runtime of this whole file.
+ */
+#define COST_ITERATIONS 50000
+
+/*
+ * The measurement the far jump was built for.
+ *
+ * A host servicing a 16-bit module's API calls pays the transition cost twice
+ * per call, on every call. The one-way probe's answer to "how do I get back"
+ * was a deliberate fault and a signal; this asks what that answer costs, and
+ * what the far jump costs instead.
+ *
+ * Both figures cover the same work -- far jump out, a few instructions in
+ * 16-bit mode, and control back in 64-bit code -- differing only in the return
+ * mechanism. The assertion is deliberately loose. The interesting output is the
+ * two numbers; a floor of 5x only fails if something has changed so
+ * fundamentally that the ratio no longer holds at all.
+ */
+TEST(the_far_jump_return_costs_far_less_than_a_signal)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    uint64_t farjump_ns = 0;
+    uint64_t signal_ns = 0;
+    ASSERT_EQ_INT(compat16_time_roundtrip(TEST_LDT_ENTRY, page, COST_ITERATIONS,
+                                          &farjump_ns),
+                  0);
+    ASSERT_EQ_INT(compat16_time_signal_path(TEST_LDT_ENTRY, page,
+                                            COST_ITERATIONS, &signal_ns),
+                  0);
+
+    double far_each = (double)farjump_ns / COST_ITERATIONS;
+    double signal_each = (double)signal_ns / COST_ITERATIONS;
+
+    printf("        far jump      %9.1f ns per round trip\n", far_each);
+    printf("        signal        %9.1f ns per round trip\n", signal_each);
+    printf("        ratio         %9.1fx\n", signal_each / far_each);
+
+    ASSERT_MSG(far_each > 0.0, "far jump measured at zero; clock resolution?");
+    ASSERT_MSG(signal_each > far_each * 5.0,
+               "expected the signal path to cost at least 5x more; "
+               "got %.1f ns against %.1f ns",
+               signal_each, far_each);
+}
+
+/*
  * The espfix64 hazard needs a 16-bit *stack* segment, which is a different
  * descriptor from the code one: writable data, and the cleared bit is B rather
  * than D. Gate the probe on the kernel accepting it.
@@ -357,6 +408,7 @@ int main(void)
     RUN_TEST(the_landing_pad_ran_in_64bit_mode);
     RUN_TEST(rsp_arrives_at_the_landing_pad_truncated_to_32_bits);
     RUN_TEST(the_landing_pad_hands_back_an_intact_rsp);
+    RUN_TEST(the_far_jump_return_costs_far_less_than_a_signal);
     RUN_TEST(kernel_accepts_a_16bit_stack_descriptor);
     RUN_TEST(rsp_survives_a_signal_taken_on_a_16bit_stack_segment);
     return harness_report();

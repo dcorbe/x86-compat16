@@ -64,12 +64,16 @@ result worth having.
    damage, the second that the trampoline repairs it before any compiled code
    runs.
 
-6. **`kernel_accepts_a_16bit_stack_descriptor`** — a writable 16-bit data
+6. **`the_far_jump_return_costs_far_less_than_a_signal`** — what the two ways
+   home actually cost, in nanoseconds, with setup hoisted out of the clock. The
+   assertion is a loose floor; the numbers it prints are the point.
+
+7. **`kernel_accepts_a_16bit_stack_descriptor`** — a writable 16-bit data
    descriptor, suitable for loading into `SS`. Note it reads back with type
    `0x3`, not the `0x2` the request implies: Linux sets the accessed bit itself
    so the LDT page can be mapped read-only.
 
-7. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
+8. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
    with a 16-bit `SS` loaded and see what happens to `RSP` across the
    `sigreturn`. This is a *characterisation* test: it records what the machine
    actually does and fires if that changes. The result contradicted the
@@ -301,4 +305,48 @@ round trip collapses. The prefix is load-bearing, not decoration.
 
 Fault-and-recover-via-signal is no longer the only way out of 16-bit code, so
 the per-call cost of a host API is not bounded below by signal delivery. What
-that cost actually is has not been measured yet, and is the next experiment.
+that cost actually is, measured, is below.
+
+## Finding: the far jump costs about 88 ns, the signal about 1765 ns
+
+Both paths do the same work — far jump out, a few instructions in 16-bit mode,
+control back in 64-bit code — and differ only in how they get home. Setup runs
+once, outside the clock, after a thousand warmup excursions. 50,000 iterations
+each.
+
+    far jump           88.3 ns per round trip
+    signal           1753.1 ns per round trip
+    ratio              19.9x
+
+Five consecutive runs gave 88.3 / 86.7 / 91.5 / 87.6 / 88.1 ns against
+1753 / 1783 / 1765 / 1753 / 1766 ns. The ratio sat between 19.3x and 20.6x. This
+is not a noisy measurement.
+
+Two caveats, both erring in the honest direction. The far-jump figure includes
+one ordinary function call and the trampoline's bookkeeping stores per
+iteration, and the whole suite is built `-O0` on purpose, so the true transition
+cost is somewhat *below* 88 ns. The signal figure includes `sigsetjmp` saving
+the signal mask — a further syscall per iteration that a signal-based host could
+shave off. It could not shave off the delivery itself, which is the bulk of it.
+
+### What this means for a module host
+
+At ~88 ns a transition, a module making 10,000 host calls a second spends under
+0.1% of a core crossing between modes. The transition is not the thing to
+optimise; it is comfortably below the noise floor of whatever the shim layer
+does on the other side.
+
+The signal path at ~1.8 µs is not catastrophic either — the same 10,000 calls
+cost under 2% of a core — but it is 20x more for no benefit, and it scales
+badly in exactly the wrong place: output-heavy paths, which are the common case
+for a BBS module, are the ones making the most calls.
+
+For scale, a bare `getpid()` on this machine — 50,000 calls, same warmup and
+timing shape, measured as a one-off outside the suite — costs 177–208 ns. The
+mode-transition round trip is **about half the price of the cheapest syscall
+there is**.
+
+That is worth sitting with. Crossing from 64-bit code into a 16-bit segment and
+back is not an exotic expense to be engineered around; on this machine it is
+cheaper than asking the kernel for the current process ID. Whatever ends up
+limiting a module host, it will not be this.
