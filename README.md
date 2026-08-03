@@ -81,7 +81,12 @@ result worth having.
    pushes and pops, and far-calls a subroutine so that `CS:IP` goes on that
    stack and `RETF` brings it back.
 
-9. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
+9. **`a_signal_can_be_taken_and_resumed_from_16bit_code`** and
+   **`sigreturn_restores_the_16bit_stack`** — the configuration espfix64 exists
+   for: `CS` and `SS` both 16-bit when the signal lands. The handler *returns*
+   rather than escaping, so that `sigreturn`'s `IRET` is the thing on trial.
+
+10. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
    with a 16-bit `SS` loaded and see what happens to `RSP` across the
    `sigreturn`. This is a *characterisation* test: it records what the machine
    actually does and fires if that changes. The result contradicted the
@@ -176,16 +181,13 @@ compatibility mode, with `CS` non-64-bit as well as `SS` 16-bit.
 That is a hypothesis. It has not been tested, and it should not be repeated as
 fact.
 
-### Next experiment
+### The experiment that followed
 
-Combine the two halves: 16-bit `CS` *and* 16-bit `SS`, then take a signal.
-
-Half of that is now done — 16-bit code **runs** on a 16-bit `SS`, see the
-finding below — but the half involving a signal is not, and it is the harder
-one. Delivery needs a `MAP_32BIT` alternate stack, and resuming in 16-bit code
-after `sigreturn` needs its own way back out to 64-bit: the probe above escapes
-by `siglongjmp`, which skips the `IRET` that is the entire subject of the
-experiment.
+Combine the two halves: 16-bit `CS` *and* 16-bit `SS`, then take a signal. Both
+halves are now done and both work — see the last two findings in this file. The
+hypothesis above, that the hazard needs the return to land in compatibility
+mode, turns out to be testable and answered: it does land there, and `sigreturn`
+handles it correctly.
 
 ## Finding: you cannot take a signal on a 64-bit stack from compatibility mode
 
@@ -455,3 +457,87 @@ excursion completes without the kernel ever being involved. A signal arriving
 while 16-bit `CS` *and* 16-bit `SS` are both live — which is the configuration
 the espfix64 finding never reached, and the one an asynchronous signal would
 find in any long-running 16-bit code — remains untested.
+
+## Finding: a signal from 16-bit code resumes cleanly, and this one was predicted
+
+The configuration every other experiment here stops short of, and the one
+espfix64 exists for: `CS` **and** `SS` both 16-bit, a signal delivered, and
+`sigreturn` `IRET`ing back into 16-bit mode.
+
+The handler deliberately **returns** rather than escaping by `siglongjmp`. That
+is the entire design. `siglongjmp` skips the `IRET`, which is the only
+instruction under test — it is why the earlier probes could not answer this.
+
+The stub pushes a word before trapping and pops it after:
+
+```
+mov   $0x1000, %sp
+pushw $0xface
+int3                      # signal delivered here
+pop   %dx                 # only works if SS *and* SP came back
+mov   %sp, %si
+ljmpl $CS64, $landing
+```
+
+The pop reads through `SS` at `SP`, so recovering `0xface` is possible only if
+the kernel restored both. Merely checking "did control return" would pass on a
+flat `SS` and prove nothing.
+
+### The prediction, written before measuring
+
+`<asm/ucontext.h>` documents the machinery, including — pointedly — the DOSEMU
+case of running in a segmented context. From it:
+
+    UC_SIGCONTEXT_SS      set    this kernel saves SS and implements espfix
+    UC_STRICT_RESTORE_SS  clear  it is only set for signals from 64-bit code
+
+with `SS` restored regardless, because `sigreturn` restores it when the saved
+selector is still valid, and ours is a live LDT entry.
+
+### Measured
+
+    cs in frame     0x0007
+    ss in frame     0x000f
+    rsp in frame    0x00000000ac1d0ffe
+    uc_flags        0x3
+    deliveries      1
+
+`uc_flags = 0x3` is `UC_FP_XSTATE | UC_SIGCONTEXT_SS`, with
+`UC_STRICT_RESTORE_SS` clear. Exactly as predicted, for exactly the documented
+reason. `cs` and `ss` in the frame are the two LDT selectors, so the signal
+really was taken in 16-bit code on the 16-bit stack; `rsp` ends `0x0ffe`, the
+16-bit `SP` after the push, so the kernel recorded the segmented stack
+pointer rather than a flat one. One delivery, no trap loop.
+
+And the 16-bit code resumed: `DX` came back `0xface`, `SI` came back `0x1000`,
+and the 64-bit caller's `SS` and `RSP` were both intact afterwards.
+
+**This is the first prediction in this repo that was right.** The espfix64
+prediction was wrong and the `RSP` prediction was wrong; both were guesses about
+undocumented behaviour. This one came from a kernel header that describes the
+contract, which is the difference.
+
+### The negative control
+
+| Mutation | Failures |
+| --- | --- |
+| remove the `INT3`, so no signal is taken | both |
+| change the word pushed before the trap | the stack-restore test only |
+| let the handler `siglongjmp` instead of returning | both |
+
+The third is the one worth reading twice. Escaping by `siglongjmp` — what every
+other probe here does — makes both tests fail, because it skips the `IRET`. That
+is the mechanism, isolated.
+
+### What this retires
+
+Asynchronous signals arriving in 16-bit code are survivable. Delivery works with
+the `MAP_32BIT` alternate stack, and resumption works because `sigreturn`
+restores a valid 16-bit `SS`.
+
+Two caveats. The trap here is synchronous (`INT3`), so it arrives at a known
+instruction boundary; a genuinely asynchronous signal arrives anywhere, and the
+one place that matters is the handful of instructions where `SS` and `SP`
+disagree, which `MOV SS`'s interrupt shadow already covers. And this says
+nothing about a signal whose handler wants to *do* something in 16-bit context —
+it only establishes that an interruption is transparent.

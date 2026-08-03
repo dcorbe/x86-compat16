@@ -263,6 +263,58 @@ struct compat16_stack16 {
 int compat16_run_stack16(int code_entry, int stack_entry, void *code_base,
                          void *stack_base, struct compat16_stack16 *out);
 
+/*
+ * SP at the instant the 16-bit stub traps: 0x1000 less the word it pushed
+ * first. The push happens before the trap on purpose, so that the pop after it
+ * can only succeed if SS and SP both came back correctly.
+ */
+#define COMPAT16_SIGRET_SP_AT_TRAP 0x0ffeu
+
+/* What a signal taken from inside 16-bit code, on a 16-bit stack, does. */
+struct compat16_sigret {
+    /* Recorded inside the handler, out of the signal frame. */
+    uint16_t cs_in_frame;  /* proves the CPU was in the 16-bit code segment */
+    uint16_t ss_in_frame;  /* proves the 16-bit stack was live */
+    uint64_t rsp_in_frame; /* the stack pointer the kernel recorded */
+    uint64_t uc_flags;     /* UC_SIGCONTEXT_SS / UC_STRICT_RESTORE_SS */
+    int deliveries;        /* how many times the handler ran; 1 is correct */
+
+    /* Recorded after the 16-bit code resumed and came home by far jump. */
+    uint64_t rax; /* the operand-size discriminator */
+    uint64_t rdx; /* the word popped AFTER the signal */
+    uint64_t rsi; /* SP once the pop is done */
+
+    uint64_t rsp_before;
+    uint64_t rsp_after;
+    uint16_t ss_before;
+    uint16_t ss_after;
+
+    int signo; /* non-zero only if the run had to be abandoned */
+};
+
+/*
+ * Take a signal with 16-bit CS *and* 16-bit SS both live, and resume.
+ *
+ * This is the configuration every other experiment here stops short of, and
+ * the one espfix64 exists for. The stub loads its 16-bit stack, pushes a word,
+ * and executes INT3. The handler does NOT siglongjmp out -- it records the
+ * frame and returns, because sigreturn's IRET back into 16-bit mode is the
+ * entire subject. Escaping by siglongjmp would skip the only instruction that
+ * matters.
+ *
+ * If the IRET works, the 16-bit code resumes at the instruction after the
+ * INT3, pops the word it pushed before the signal, and far-jumps home. The
+ * popped value is the evidence: it can only be right if the kernel restored
+ * both the 16-bit SS and the 16-bit SP, because it is read through them.
+ *
+ * SIGSEGV and SIGILL are still caught and still escape by siglongjmp, so a
+ * failed IRET reports a result rather than killing the process.
+ *
+ * Returns 0 on success. Returns -1 with errno set on failure to set up.
+ */
+int compat16_run_sigret(int code_entry, int stack_entry, void *code_base,
+                        void *stack_base, struct compat16_sigret *out);
+
 /* What a signal taken with a 16-bit stack segment does to RSP. */
 struct compat16_espfix {
     uint64_t rsp_before;    /* RSP in 64-bit mode, before the trap */

@@ -220,12 +220,14 @@ static int probe_altstack_install(void)
  * Returns 0 on success. On failure any handler already installed is put back,
  * so a partial install never leaks out of the call.
  */
-static int probe_signals_install(struct sigaction *saved)
+static int probe_signals_install_handler(struct sigaction *saved,
+                                         void (*handler)(int, siginfo_t *,
+                                                         void *))
 {
     struct sigaction sa;
 
     memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = probe_trap_handler;
+    sa.sa_sigaction = handler;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
 
@@ -238,6 +240,12 @@ static int probe_signals_install(struct sigaction *saved)
     }
 
     return 0;
+}
+
+/* The ordinary case: every probe signal escapes by siglongjmp. */
+static int probe_signals_install(struct sigaction *saved)
+{
+    return probe_signals_install_handler(saved, probe_trap_handler);
 }
 
 /* Put back what probe_signals_install() displaced. */
@@ -822,6 +830,181 @@ int compat16_run_stack16(int code_entry, int stack_entry, void *code_base,
     out->rbp = stack16_slots[STACK16_SLOT_RSI];
     out->rsp_at_landing = stack16_slots[STACK16_SLOT_RSP];
     out->ss_at_landing = stack16_slots[STACK16_SLOT_SS];
+    out->rsp_before = stack16_rsp_before;
+    out->rsp_after = stack16_rsp_after;
+    out->ss_before = stack16_ss_before;
+    out->ss_after = stack16_ss_after;
+    out->signo = (int)probe_signo;
+    return 0;
+}
+
+/*
+ * The stub that takes a signal from inside 16-bit mode.
+ *
+ *      .code16
+ *   0: mov   $0x1234, %ax          b8 34 12
+ *   3: mov   $SS, %bx              bb ss ss    patched
+ *   6: mov   %bx, %ss              8e d3
+ *   8: mov   $0x1000, %sp          bc 00 10
+ *   b: pushw $0xface               68 ce fa    pushed BEFORE the trap
+ *   e: int3                        cc          <- the signal
+ *   f: pop   %dx                   5a          only works if SS and SP came back
+ *  10: mov   %sp, %si              89 e6
+ *  12: ljmpl $CS64, $LANDING       66 ea <off32> <sel16>   both patched
+ *
+ * The push before the trap and the pop after it are the whole design. The pop
+ * reads through the 16-bit SS at the 16-bit SP, so recovering 0xface is only
+ * possible if sigreturn restored both. A test that merely checked "did we get
+ * back" would pass on a flat SS too, and prove nothing about espfix.
+ */
+static unsigned char SIGRET_CODE[] = {
+    0xb8, 0x34, 0x12,                                /* mov  $0x1234, %ax  */
+    0xbb, 0x00, 0x00,                                /* mov  $SS, %bx      */
+    0x8e, 0xd3,                                      /* mov  %bx, %ss      */
+    0xbc, 0x00, 0x10,                                /* mov  $0x1000, %sp  */
+    0x68, 0xce, 0xfa,                                /* pushw $0xface      */
+    0xcc,                                            /* int3               */
+    0x5a,                                            /* pop  %dx           */
+    0x89, 0xe6,                                      /* mov  %sp, %si      */
+    0x66, 0xea, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* ljmpl $CS64, $pad  */
+};
+#define SIGRET_STACK_SELECTOR_FIELD 4
+#define SIGRET_JMP_OFFSET_FIELD 20
+#define SIGRET_JMP_SELECTOR_FIELD 24
+
+/*
+ * Ceiling on handler entries before the run is abandoned.
+ *
+ * If the IRET were to land back on the INT3 rather than past it, the handler
+ * and the trap would take turns forever. One delivery is the correct answer;
+ * anything above this means something is wrong in a way worth escaping from
+ * rather than hanging on.
+ */
+#define SIGRET_MAX_DELIVERIES 4
+
+static volatile sig_atomic_t sigret_deliveries;
+static volatile uint16_t sigret_cs;
+static volatile uint16_t sigret_ss;
+static volatile uint64_t sigret_rsp;
+static volatile uint64_t sigret_flags;
+
+/*
+ * Unlike probe_trap_handler(), this returns rather than escaping -- for
+ * SIGTRAP, which is the designed trap. Returning is what puts sigreturn's IRET
+ * on trial.
+ *
+ * SIGSEGV and SIGILL still escape, because reaching them means the IRET failed
+ * and there is nothing left to measure.
+ */
+static void sigret_handler(int signo, siginfo_t *info, void *ctx)
+{
+    const ucontext_t *uc = ctx;
+    (void)info;
+
+    if (signo != SIGTRAP) {
+        probe_signo = signo;
+        siglongjmp(probe_recovery, 1);
+    }
+
+    sigret_deliveries++;
+
+    /* CS sits in the low 16 bits of the packed greg, SS in the top. */
+    sigret_cs = (uint16_t)(uc->uc_mcontext.gregs[REG_CSGSFS] & 0xffffu);
+    sigret_ss = (uint16_t)(uc->uc_mcontext.gregs[REG_CSGSFS] >> 48);
+    sigret_rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+    sigret_flags = (uint64_t)uc->uc_flags;
+
+    if (sigret_deliveries > SIGRET_MAX_DELIVERIES) {
+        probe_signo = signo;
+        siglongjmp(probe_recovery, 1);
+    }
+}
+
+int compat16_run_sigret(int code_entry, int stack_entry, void *code_base,
+                        void *stack_base, struct compat16_sigret *out)
+{
+    static struct sigaction saved[PROBE_SIGNAL_COUNT];
+
+    (void)stack_base;
+
+    unsigned char *page = code_base;
+    unsigned char *landing = page + ROUNDTRIP_LANDING_OFFSET;
+
+    if ((uintptr_t)landing > UINT32_MAX) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    uint16_t cs64;
+    __asm__ __volatile__("movw %%cs, %0" : "=r"(cs64));
+
+    uint16_t code_sel = COMPAT16_SELECTOR(code_entry);
+    uint16_t stack_sel = COMPAT16_SELECTOR(stack_entry);
+    uint32_t landing_linear = (uint32_t)(uintptr_t)landing;
+
+    memcpy(SIGRET_CODE + SIGRET_STACK_SELECTOR_FIELD, &stack_sel,
+           sizeof(stack_sel));
+    memcpy(SIGRET_CODE + SIGRET_JMP_OFFSET_FIELD, &landing_linear,
+           sizeof(landing_linear));
+    memcpy(SIGRET_CODE + SIGRET_JMP_SELECTOR_FIELD, &cs64, sizeof(cs64));
+
+    memcpy(page, SIGRET_CODE, sizeof(SIGRET_CODE));
+    memcpy(landing, STACK16_LANDING, sizeof(STACK16_LANDING));
+
+    if (probe_altstack_install() != 0)
+        return -1;
+    if (probe_signals_install_handler(saved, sigret_handler) != 0)
+        return -1;
+
+    probe_signo = 0;
+    sigret_deliveries = 0;
+    sigret_cs = 0;
+    sigret_ss = 0;
+    sigret_rsp = 0;
+    sigret_flags = 0;
+    memset(stack16_slots, 0, sizeof(stack16_slots));
+    stack16_rsp_before = 0;
+    stack16_rsp_after = 0;
+    stack16_ss_before = 0;
+    stack16_ss_after = 0;
+
+    struct far_ptr target = {
+        .offset = 0,
+        .selector = code_sel,
+    };
+
+    if (sigsetjmp(probe_recovery, 1) == 0) {
+        __asm__ __volatile__(
+            "movq %%rsp, %[rsp_before]\n\t"
+            "movw %%ss, %[ss_before]\n\t"
+            "leaq 1f(%%rip), %%r11\n\t"
+            "xorl %%r13d, %%r13d\n\t"
+            "movw %%ss, %%r13w\n\t"
+            "movq %[slots], %%r14\n\t"
+            "movq %%rsp, %%r15\n\t"
+            "ljmpl *(%[target])\n"
+            "1:\n\t"
+            "movq %%rsp, %[rsp_after]\n\t"
+            "movw %%ss, %[ss_after]"
+            : [rsp_before] "=m"(stack16_rsp_before),
+              [rsp_after] "=m"(stack16_rsp_after),
+              [ss_before] "=m"(stack16_ss_before),
+              [ss_after] "=m"(stack16_ss_after)
+            : [target] "r"(&target), [slots] "r"(stack16_slots)
+            : "rax", "rcx", "rdx", "rsi", "r10", "r11", "r13", "r14", "r15",
+              "memory");
+    }
+
+    probe_signals_restore(saved);
+
+    out->cs_in_frame = sigret_cs;
+    out->ss_in_frame = sigret_ss;
+    out->rsp_in_frame = sigret_rsp;
+    out->uc_flags = sigret_flags;
+    out->deliveries = (int)sigret_deliveries;
+    out->rax = stack16_slots[STACK16_SLOT_RAX];
+    out->rdx = stack16_slots[STACK16_SLOT_RDX];
+    out->rsi = stack16_slots[STACK16_SLOT_RSI];
     out->rsp_before = stack16_rsp_before;
     out->rsp_after = stack16_rsp_after;
     out->ss_before = stack16_ss_before;

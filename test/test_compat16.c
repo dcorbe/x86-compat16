@@ -517,6 +517,103 @@ TEST(rsp_survives_a_signal_taken_on_a_16bit_stack_segment)
     ASSERT_EQ_U64(fix.rsp_after, fix.rsp_before);
 }
 
+/*
+ * The experiment every other one here stops short of, and the reason espfix64
+ * exists: a signal taken with 16-bit `CS` *and* 16-bit `SS` both live, resumed
+ * through sigreturn's IRET.
+ *
+ * The handler deliberately RETURNS rather than escaping by siglongjmp. That is
+ * the whole point -- siglongjmp would skip the IRET, which is the only
+ * instruction under test.
+ *
+ * Predicted from <asm/ucontext.h> before measuring:
+ *
+ *   UC_SIGCONTEXT_SS      set    -- this kernel saves SS and implements espfix
+ *   UC_STRICT_RESTORE_SS  clear  -- it is only set for signals from 64-bit code
+ *
+ * with SS restored anyway, because sigreturn restores it when the saved
+ * selector is still valid, and ours is a live LDT entry.
+ *
+ * These tests run last in the suite. If the IRET fails badly enough to kill
+ * the process rather than raise a catchable SIGSEGV, everything above has
+ * already printed.
+ */
+TEST(a_signal_can_be_taken_and_resumed_from_16bit_code)
+{
+    void *code = map_low_page();
+    void *stack = map_low_page();
+    ASSERT_MSG(code != NULL && stack != NULL,
+               "could not map pages below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, code, SEGMENT_BYTES), 0);
+    ASSERT_EQ_INT(compat16_install_stack_segment(TEST_LDT_STACK_ENTRY, stack,
+                                                 SEGMENT_BYTES),
+                  0);
+
+    struct compat16_sigret run = {0};
+    ASSERT_EQ_INT(compat16_run_sigret(TEST_LDT_ENTRY, TEST_LDT_STACK_ENTRY,
+                                      code, stack, &run),
+                  0);
+
+    printf("        cs in frame     %#06x\n", run.cs_in_frame);
+    printf("        ss in frame     %#06x\n", run.ss_in_frame);
+    printf("        rsp in frame    %#018llx\n",
+           (unsigned long long)run.rsp_in_frame);
+    printf("        uc_flags        %#llx\n",
+           (unsigned long long)run.uc_flags);
+    printf("        deliveries      %d\n", run.deliveries);
+
+    ASSERT_MSG(run.signo == 0, "run abandoned on signal %d", run.signo);
+
+    /* Delivered once, and resumed rather than trapping over and over. */
+    ASSERT_EQ_INT(run.deliveries, 1);
+
+    /* The frame really was taken in 16-bit code on the 16-bit stack. */
+    ASSERT_EQ_INT(run.cs_in_frame, COMPAT16_SELECTOR(TEST_LDT_ENTRY));
+    ASSERT_EQ_INT(run.ss_in_frame, COMPAT16_SELECTOR(TEST_LDT_STACK_ENTRY));
+
+    /* And the caller got its own stack back. */
+    ASSERT_EQ_INT(run.ss_after, run.ss_before);
+    ASSERT_EQ_U64(run.rsp_after, run.rsp_before);
+}
+
+/*
+ * The evidence that sigreturn restored the 16-bit stack, not merely that
+ * control came back.
+ *
+ * The stub pushes a word before trapping and pops it after. The pop reads
+ * through SS at SP, so recovering the value is only possible if the kernel put
+ * both back. Landing on a flat SS would read some unrelated address -- a
+ * different answer, or a fault.
+ */
+TEST(sigreturn_restores_the_16bit_stack)
+{
+    void *code = map_low_page();
+    void *stack = map_low_page();
+    ASSERT_MSG(code != NULL && stack != NULL,
+               "could not map pages below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, code, SEGMENT_BYTES), 0);
+    ASSERT_EQ_INT(compat16_install_stack_segment(TEST_LDT_STACK_ENTRY, stack,
+                                                 SEGMENT_BYTES),
+                  0);
+
+    struct compat16_sigret run = {0};
+    ASSERT_EQ_INT(compat16_run_sigret(TEST_LDT_ENTRY, TEST_LDT_STACK_ENTRY,
+                                      code, stack, &run),
+                  0);
+
+    /* The kernel recorded the 16-bit SP, not a 64-bit one. */
+    ASSERT_EQ_U64(run.rsp_in_frame & 0xffffu, COMPAT16_SIGRET_SP_AT_TRAP);
+
+    /* The 16-bit code ran on past the trap... */
+    ASSERT_EQ_U64(run.rax & 0xffffu, 0x1234u);
+
+    /* ...and the pop read back exactly what the push left. */
+    ASSERT_EQ_U64(run.rdx & 0xffffu, COMPAT16_STACK16_PUSHED);
+    ASSERT_EQ_U64(run.rsi & 0xffffu, COMPAT16_STACK16_INITIAL_SP);
+}
+
 int main(void)
 {
     /*
@@ -543,5 +640,13 @@ int main(void)
     RUN_TEST(a_far_call_and_ret_work_on_a_16bit_stack);
     RUN_TEST(kernel_accepts_a_16bit_stack_descriptor);
     RUN_TEST(rsp_survives_a_signal_taken_on_a_16bit_stack_segment);
+
+    /*
+     * Last on purpose: this pair puts sigreturn's IRET back into 16-bit mode
+     * on trial, and a failure mode that kills the process outright would take
+     * every result after it down too.
+     */
+    RUN_TEST(a_signal_can_be_taken_and_resumed_from_16bit_code);
+    RUN_TEST(sigreturn_restores_the_16bit_stack);
     return harness_report();
 }
