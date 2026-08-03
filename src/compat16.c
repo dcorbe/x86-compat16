@@ -361,7 +361,7 @@ static unsigned char ROUNDTRIP_CODE16[] = {
  * upper half zeroed, even though SS was never reloaded and the 16-bit leg never
  * touched the stack. The general registers survive; the stack pointer does not.
  *
- * Two consequences, both of which matter more to a host than to this test:
+ * Two consequences, both of which matter more in earnest than they do here:
  *
  *   1. The repair is three bytes and one spare register, done here before any
  *      compiled code gets a chance to run on a broken stack pointer. It is not

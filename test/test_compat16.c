@@ -140,9 +140,9 @@ TEST(instructions_decode_with_16bit_default_operand_size)
  * The far jump back.
  *
  * Everything above establishes a one-way door: enter 16-bit mode, trap, and let
- * a signal handler carry the process home. A signal per transition is fine for
- * an experiment and ruinous for a host that has to service hundreds of distinct
- * API calls made from inside 16-bit code.
+ * a signal handler carry the process home. A signal per transition is fine when
+ * you cross once and ruinous when you cross constantly, which is what any real
+ * use of 16-bit code does.
  *
  * The claim under test is that no signal is needed, because a 16-bit far jump
  * carrying a 0x66 operand-size prefix takes a 32-bit offset, which is enough to
@@ -256,9 +256,9 @@ TEST(rsp_arrives_at_the_landing_pad_truncated_to_32_bits)
 }
 
 /*
- * The excursion must still leave the caller's stack exactly as it found it: a
- * host transitioning on every API call cannot hand its callers a stack pointer
- * that drifts.
+ * The excursion must still leave the caller's stack exactly as it found it.
+ * Code that crosses on every call cannot hand its callers a stack pointer that
+ * drifts.
  *
  * Given the truncation above, this passes only because the landing pad puts RSP
  * back from R15 before returning. That is the point being recorded -- not that
@@ -289,10 +289,10 @@ TEST(the_landing_pad_hands_back_an_intact_rsp)
 /*
  * The measurement the far jump was built for.
  *
- * A host servicing a 16-bit module's API calls pays the transition cost twice
- * per call, on every call. The one-way probe's answer to "how do I get back"
- * was a deliberate fault and a signal; this asks what that answer costs, and
- * what the far jump costs instead.
+ * Code that calls out of 16-bit mode pays the transition cost twice per call,
+ * on every call. The one-way probe's answer to "how do I get back" was a
+ * deliberate fault and a signal; this asks what that answer costs, and what the
+ * far jump costs instead.
  *
  * Both figures cover the same work -- far jump out, a few instructions in
  * 16-bit mode, and control back in 64-bit code -- differing only in the return

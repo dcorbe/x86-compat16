@@ -208,12 +208,12 @@ stack discipline with only 32 bits to express it.
 back out of 16-bit code, but *only* with a low alternate stack. Without one it
 is not merely unreliable, it is fatal.
 
-## Finding: the round trip needs no signal, and costs three bytes of stack repair
+## Finding: the round trip needs no signal, and three bytes of stack repair
 
 The one-way probe leaves an obvious question hanging. A signal per transition is
-tolerable for an experiment and ruinous for a host that has to service hundreds
-of distinct API calls made from inside 16-bit code. So: can 16-bit code get back
-to 64-bit mode on its own?
+tolerable when you cross once and ruinous when you cross constantly, which is
+what any real use of 16-bit code does. So: can 16-bit code get back to 64-bit
+mode on its own?
 
 It can. The mechanism is one prefix byte.
 
@@ -304,8 +304,8 @@ round trip collapses. The prefix is load-bearing, not decoration.
 ### Consequence for the design
 
 Fault-and-recover-via-signal is no longer the only way out of 16-bit code, so
-the per-call cost of a host API is not bounded below by signal delivery. What
-that cost actually is, measured, is below.
+the cost of crossing is not bounded below by signal delivery. What that cost
+actually is, measured, is below.
 
 ## Finding: the far jump costs about 88 ns, the signal about 1765 ns
 
@@ -326,20 +326,20 @@ Two caveats, both erring in the honest direction. The far-jump figure includes
 one ordinary function call and the trampoline's bookkeeping stores per
 iteration, and the whole suite is built `-O0` on purpose, so the true transition
 cost is somewhat *below* 88 ns. The signal figure includes `sigsetjmp` saving
-the signal mask — a further syscall per iteration that a signal-based host could
-shave off. It could not shave off the delivery itself, which is the bulk of it.
+the signal mask — a further syscall per iteration that a signal-based
+design could shave off. It could not shave off the delivery itself, which is
+the bulk of it.
 
-### What this means for a module host
+### What this means in practice
 
-At ~88 ns a transition, a module making 10,000 host calls a second spends under
-0.1% of a core crossing between modes. The transition is not the thing to
-optimise; it is comfortably below the noise floor of whatever the shim layer
-does on the other side.
+At ~88 ns a transition, code crossing 10,000 times a second spends under 0.1% of
+a core in transit. Crossing is not the thing to optimise; it sits comfortably
+below the noise floor of whatever work is being done on either side of it.
 
-The signal path at ~1.8 µs is not catastrophic either — the same 10,000 calls
-cost under 2% of a core — but it is 20x more for no benefit, and it scales
-badly in exactly the wrong place: output-heavy paths, which are the common case
-for a BBS module, are the ones making the most calls.
+The signal path at ~1.8 µs is not catastrophic either — the same 10,000
+crossings cost under 2% of a core — but it is 20x more for no benefit, and it
+degrades exactly where you would least want it to, since the code that crosses
+most often is the code that can least afford it.
 
 For scale, a bare `getpid()` on this machine — 50,000 calls, same warmup and
 timing shape, measured as a one-off outside the suite — costs 177–208 ns. The
@@ -349,20 +349,7 @@ there is**.
 That is worth sitting with. Crossing from 64-bit code into a 16-bit segment and
 back is not an exotic expense to be engineered around; on this machine it is
 cheaper than asking the kernel for the current process ID. Whatever ends up
-limiting a module host, it will not be this.
-
-## Why this exists
-
-The BBS references above are not incidental. This work came out of building a
-Linux-native host for unmodified Galacticomm MajorBBS and Worldgroup modules,
-binaries from the early nineties whose 16-bit side is Phar Lap 286 protected
-mode. Running them means either emulating an x86 or persuading a real one to
-execute 16-bit protected-mode code, and the second option looked possible on
-paper. It is possible in practice, which is what this repo establishes.
-
-None of that is needed to read the results. The question — can a 64-bit Linux
-process execute 16-bit protected-mode code, and what does it cost — stands on
-its own, and so do the answers.
+limiting a program built this way, it will not be this.
 
 ## Scope
 
@@ -374,9 +361,9 @@ That distinction is deliberate rather than aspirational. The code here uses
 file-scope statics throughout and is not reentrant; it is compiled `-O0` because
 several tests depend on exact register contents across a mode transition, and
 optimisation is free to keep those values somewhere the test cannot see. Both
-choices are right for a test and wrong for a runtime. A host wanting this
-capability should be written against the *findings* below, not grown from this
-code.
+choices are right for a test and wrong for a runtime. Anything wanting this
+capability in earnest should be written against the *findings* below, not grown
+from this code.
 
 What the suite is good for is staying honest. Kernels change, hardening options
 spread, and `CONFIG_X86_16BIT=n` is a legitimate and increasingly common build

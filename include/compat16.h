@@ -167,8 +167,8 @@ struct compat16_roundtrip {
  * and `rsp_at_landing` record the damage; `rsp_after` records the repair.
  *
  * Signal handlers are installed anyway, covering the case where the CPU or
- * kernel declines the transition. Reaching one means the claim is false; `signo`
- * then reports which signal ended it, instead of the test binary dying.
+ * kernel declines the transition. Reaching one means the claim is false, and
+ * `signo` then reports which signal ended it rather than the binary dying.
  *
  * Returns 0 on success. Returns -1 on failure to set up, with errno set.
  */
@@ -201,7 +201,7 @@ int compat16_time_roundtrip(int entry, void *segment_base, uint64_t iterations,
  *
  * Note this times the recovery path exactly as compat16_run_probe() implements
  * it, including sigsetjmp() saving the signal mask -- a further syscall per
- * iteration. A signal-based host could shave that off. It could not shave off
+ * iteration. A signal-based design could shave that off. It could not shave off
  * the signal delivery itself, which is the cost that matters.
  *
  * Returns 0 on success, -1 with errno set on failure.
