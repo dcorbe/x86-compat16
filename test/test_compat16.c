@@ -137,6 +137,149 @@ TEST(instructions_decode_with_16bit_default_operand_size)
 }
 
 /*
+ * The far jump back.
+ *
+ * Everything above establishes a one-way door: enter 16-bit mode, trap, and let
+ * a signal handler carry the process home. A signal per transition is fine for
+ * an experiment and ruinous for a host that has to service hundreds of distinct
+ * API calls made from inside 16-bit code.
+ *
+ * The claim under test is that no signal is needed, because a 16-bit far jump
+ * carrying a 0x66 operand-size prefix takes a 32-bit offset, which is enough to
+ * name any address below 4 GiB -- including a landing pad in a 64-bit code
+ * segment. This is the same manoeuvre Windows uses to reach 64-bit code from
+ * WOW64, one segment size further down.
+ *
+ * signo is the headline: 0 means the round trip completed without the kernel
+ * ever being involved.
+ */
+TEST(far_jump_returns_from_16bit_mode_without_taking_a_signal)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    struct compat16_roundtrip trip = {0};
+    ASSERT_EQ_INT(
+        compat16_run_roundtrip(TEST_LDT_ENTRY, page, PROBE_SEED, &trip), 0);
+
+    ASSERT_MSG(trip.signo == 0, "expected no signal, got signal %d",
+               trip.signo);
+    ASSERT_EQ_INT(trip.cs_after, trip.cs_before);
+}
+
+/*
+ * A round trip that never went anywhere would also take no signal. The 16-bit
+ * leg has to be shown to have run, and to have run as 16-bit code: same
+ * operand-size discriminator as the one-way probe, for the same reason.
+ */
+TEST(the_16bit_leg_of_the_round_trip_decoded_as_16bit_code)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    struct compat16_roundtrip trip = {0};
+    ASSERT_EQ_INT(
+        compat16_run_roundtrip(TEST_LDT_ENTRY, page, PROBE_SEED, &trip), 0);
+
+    ASSERT_EQ_U64(trip.rax, PROBE_SEED_RESULT_16BIT);
+}
+
+/*
+ * And the far side has to be shown to be genuinely 64-bit, not merely
+ * somewhere else. The landing pad's first instruction is a REX.W movabs whose
+ * bytes stay decodable -- and produce a different answer -- if the CPU were
+ * still in compatibility mode. Arriving is not the same as arriving in 64-bit
+ * mode.
+ */
+TEST(the_landing_pad_ran_in_64bit_mode)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    struct compat16_roundtrip trip = {0};
+    ASSERT_EQ_INT(
+        compat16_run_roundtrip(TEST_LDT_ENTRY, page, PROBE_SEED, &trip), 0);
+
+    ASSERT_EQ_U64(trip.r10, COMPAT16_LANDING_MARK);
+}
+
+/*
+ * The one the round trip got wrong, and the reason this file says
+ * `rsp_at_landing` at all.
+ *
+ * The expectation was that RSP would be untouched. SS is never reloaded, the
+ * 16-bit leg pushes nothing, and no instruction anywhere in the excursion names
+ * the stack pointer. It is nonetheless truncated: what arrives at the landing
+ * pad is the low 32 bits of what left, upper half zeroed.
+ *
+ * That it is *exactly* a truncation is the useful part, and worth asserting
+ * rather than merely printing. A stack pointer that came back mangled in some
+ * other way, or that varied between runs, would mean the excursion could not be
+ * made transparent at all. A clean truncation means the original value is
+ * recoverable from a register that did survive -- and this test fires if that
+ * ever stops being true.
+ *
+ * Note the contrast with R11 in the test above: the same excursion that
+ * truncates RSP carries a return address above 4 GiB through R11 intact. This
+ * is specific to the stack pointer, not a general narrowing of the register
+ * file.
+ */
+TEST(rsp_arrives_at_the_landing_pad_truncated_to_32_bits)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    struct compat16_roundtrip trip = {0};
+    ASSERT_EQ_INT(
+        compat16_run_roundtrip(TEST_LDT_ENTRY, page, PROBE_SEED, &trip), 0);
+
+    printf("        rsp before      %#018llx\n",
+           (unsigned long long)trip.rsp_before);
+    printf("        rsp at landing  %#018llx\n",
+           (unsigned long long)trip.rsp_at_landing);
+
+    /* The upper half is gone... */
+    ASSERT_MSG(trip.rsp_before > UINT32_MAX,
+               "rsp_before %#llx has nothing in its upper half to lose",
+               (unsigned long long)trip.rsp_before);
+
+    /* ...and the lower half is untouched. */
+    ASSERT_EQ_U64(trip.rsp_at_landing, trip.rsp_before & 0xffffffffull);
+}
+
+/*
+ * The excursion must still leave the caller's stack exactly as it found it: a
+ * host transitioning on every API call cannot hand its callers a stack pointer
+ * that drifts.
+ *
+ * Given the truncation above, this passes only because the landing pad puts RSP
+ * back from R15 before returning. That is the point being recorded -- not that
+ * the hardware preserves RSP, which it does not, but that three bytes in the
+ * trampoline make the damage invisible to everything upstream.
+ */
+TEST(the_landing_pad_hands_back_an_intact_rsp)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    struct compat16_roundtrip trip = {0};
+    ASSERT_EQ_INT(
+        compat16_run_roundtrip(TEST_LDT_ENTRY, page, PROBE_SEED, &trip), 0);
+
+    ASSERT_EQ_U64(trip.rsp_after, trip.rsp_before);
+}
+
+/*
  * The espfix64 hazard needs a 16-bit *stack* segment, which is a different
  * descriptor from the code one: writable data, and the cleared bit is B rather
  * than D. Gate the probe on the kernel accepting it.
@@ -209,6 +352,11 @@ int main(void)
     RUN_TEST(installed_descriptor_selects_16bit_compatibility_mode);
     RUN_TEST(far_jump_enters_the_16bit_code_segment);
     RUN_TEST(instructions_decode_with_16bit_default_operand_size);
+    RUN_TEST(far_jump_returns_from_16bit_mode_without_taking_a_signal);
+    RUN_TEST(the_16bit_leg_of_the_round_trip_decoded_as_16bit_code);
+    RUN_TEST(the_landing_pad_ran_in_64bit_mode);
+    RUN_TEST(rsp_arrives_at_the_landing_pad_truncated_to_32_bits);
+    RUN_TEST(the_landing_pad_hands_back_an_intact_rsp);
     RUN_TEST(kernel_accepts_a_16bit_stack_descriptor);
     RUN_TEST(rsp_survives_a_signal_taken_on_a_16bit_stack_segment);
     return harness_report();

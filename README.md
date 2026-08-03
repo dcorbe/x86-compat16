@@ -37,22 +37,39 @@ result worth having.
    code descriptor with `seg_32bit = 0`. This is the gate; nothing later
    matters if it fails.
 
-2. **D bit readback** *(planned)* — dumping the LDT shows the descriptor really
-   has its default-operand-size bit clear, proving the kernel did not normalise
-   the request into an ordinary 32-bit segment.
+2. **`installed_descriptor_selects_16bit_compatibility_mode`** — dumping the
+   LDT shows the descriptor really has its default-operand-size bit clear,
+   proving the kernel did not normalise the request into an ordinary 32-bit
+   segment.
 
-3. **Execution** *(planned)* — far-jump into the segment and run a stub whose
-   *decoding* differs between 16- and 32-bit modes, so that a CPU not actually
-   in 16-bit mode produces a different answer rather than the same one. The
-   stub traps back out through a signal handler, which is also how the CPU's
-   `CS` at fault time is captured.
+3. **`far_jump_enters_the_16bit_code_segment`** and
+   **`instructions_decode_with_16bit_default_operand_size`** — far-jump into the
+   segment and run a stub whose *decoding* differs between 16- and 32-bit modes,
+   so that a CPU not actually in 16-bit mode produces a different answer rather
+   than the same one. The stub traps back out through a signal handler, which is
+   also how the CPU's `CS` at fault time is captured.
 
-4. **`kernel_accepts_a_16bit_stack_descriptor`** — a writable 16-bit data
+4. **`far_jump_returns_from_16bit_mode_without_taking_a_signal`**, with
+   **`the_16bit_leg_of_the_round_trip_decoded_as_16bit_code`** and
+   **`the_landing_pad_ran_in_64bit_mode`** either side of it — the whole
+   excursion out to 16-bit code and back, by far jump in both directions, with
+   the kernel never involved. Each end carries its own operand-size
+   discriminator, because a round trip that never went anywhere would also take
+   no signal.
+
+5. **`rsp_arrives_at_the_landing_pad_truncated_to_32_bits`** and
+   **`the_landing_pad_hands_back_an_intact_rsp`** — a *characterisation* pair.
+   `RSP` does not survive the excursion; it comes back holding only its low 32
+   bits, which was not predicted. The first test pins the exact shape of the
+   damage, the second that the trampoline repairs it before any compiled code
+   runs.
+
+6. **`kernel_accepts_a_16bit_stack_descriptor`** — a writable 16-bit data
    descriptor, suitable for loading into `SS`. Note it reads back with type
    `0x3`, not the `0x2` the request implies: Linux sets the accessed bit itself
    so the LDT page can be mapped read-only.
 
-5. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
+7. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
    with a 16-bit `SS` loaded and see what happens to `RSP` across the
    `sigreturn`. This is a *characterisation* test: it records what the machine
    actually does and fires if that changes. The result contradicted the
@@ -60,17 +77,23 @@ result worth having.
 
 ## Note on the execution test's design
 
-Returning to 64-bit code from a 16-bit segment by far jump is awkward: the
-return target is a 64-bit address that a 16-bit far jump cannot encode. The
-probe sidesteps this by faulting deliberately and recovering through a signal
-handler, which runs in 64-bit mode and `siglongjmp`s out. The signal frame is a
-convenient bonus: it carries the register state at fault time, including `CS`.
+The execution probe is deliberately one-way. Its return target is a 64-bit
+address, which a bare 16-bit far jump cannot encode, so the probe faults on
+purpose and recovers through a signal handler running in 64-bit mode, which
+`siglongjmp`s out. The signal frame is a convenient bonus: it carries the
+register state at fault time, including `CS`.
+
+That is the probe's design, not a limit of the hardware. A 16-bit far jump
+*can* be made to encode a 32-bit target, and the round trip below does exactly
+that — no signal, no kernel. The one-way probe is kept as it is because a
+deliberate fault is a cleaner way to capture `CS` mid-flight than anything the
+round trip offers.
 
 ## Result
 
-All four tests pass on the environment above. A 64-bit process really does
-create a 16-bit protected-mode code segment, far-jump into it, and execute
-there, with the kernel in long mode the whole time and no hypervisor anywhere.
+All tests pass on the environment above. A 64-bit process really does create a
+16-bit protected-mode code segment, far-jump into it, and execute there, with
+the kernel in long mode the whole time and no hypervisor anywhere.
 
 ### The negative control
 
@@ -180,3 +203,102 @@ stack discipline with only 32 bits to express it.
 **Consequence for the design:** fault-and-recover-via-signal is a valid way
 back out of 16-bit code, but *only* with a low alternate stack. Without one it
 is not merely unreliable, it is fatal.
+
+## Finding: the round trip needs no signal, and costs three bytes of stack repair
+
+The one-way probe leaves an obvious question hanging. A signal per transition is
+tolerable for an experiment and ruinous for a host that has to service hundreds
+of distinct API calls made from inside 16-bit code. So: can 16-bit code get back
+to 64-bit mode on its own?
+
+It can. The mechanism is one prefix byte.
+
+In a 16-bit code segment, `EA` is `JMP ptr16:16` and its offset field is two
+bytes wide — enough to reach anywhere inside a 64 KiB segment and nowhere else.
+Prefixed with `0x66`, the same opcode becomes `JMP ptr16:32`: a 32-bit offset
+and the selector alongside it, which between them can name any address below
+4 GiB in any segment the LDT or GDT describes, including the flat 64-bit `CS`.
+A 16-bit instruction thereby addresses a 4 GiB space. This is the manoeuvre
+Windows uses to reach 64-bit code from WOW64, one segment size further down.
+
+So the outbound jump lands on a stub in a `MAP_32BIT` page, and the stub is
+assembled as 64-bit code. The CPU arrives there in 64-bit mode.
+
+**Measured:**
+
+    far_jump_returns_from_16bit_mode_without_taking_a_signal   PASS   signo == 0
+    the_16bit_leg_of_the_round_trip_decoded_as_16bit_code      PASS
+    the_landing_pad_ran_in_64bit_mode                          PASS
+
+The middle test is the same operand-size discriminator the one-way probe uses,
+so the 16-bit leg is known to have run *as 16-bit code*. The third is its mirror
+image: the landing pad's first instruction is a `REX.W movabs` whose immediate
+has `0x90909090` in its upper half, so if the CPU were somehow still in
+compatibility mode those bytes would decode as a `DEC`, a 32-bit `MOV` and four
+`NOP`s — a wrong answer rather than a crash. Arriving is not the same as
+arriving in 64-bit mode, and both are checked.
+
+### Only the trampoline is confined to the low 4 GiB
+
+The return address does not have to be. It travels in `R11`, and the landing pad
+leaves through `jmp *%r11` to a caller sitting far above 4 GiB. Compatibility
+mode has no encoding that names `r8`–`r15`, and that inaccessibility is exactly
+what keeps their contents safe across the excursion. Three registers are used
+this way — `R11` the return address, `R14` a result slot, `R15` the saved stack
+pointer — and all three survive intact.
+
+### The prediction that was wrong: RSP is truncated
+
+`SS` is never reloaded. The 16-bit leg pushes nothing. No instruction in the
+excursion names the stack pointer. `RSP` should have been untouched.
+
+    rsp before      0x00007ffc894c7500
+    rsp at landing  0x00000000894c7500
+
+It arrives holding the low 32 bits of what it left with, upper half zeroed.
+Left alone, the process then dies the moment compiled code touches the stack —
+which is what the first version of this test did, reporting `SIGSEGV` from a
+round trip that had otherwise entirely succeeded.
+
+That it is *exactly* a truncation is the useful part, and the test asserts the
+relationship rather than merely printing it. A stack pointer mangled some other
+way, or varying between runs, would mean the excursion could not be made
+transparent at all. A clean truncation means the value is recoverable from a
+register that did survive, so the landing pad restores it from `R15` — three
+bytes, `4c 89 fc` — before any compiled code gets to run. Callers never see it.
+
+Note the contrast: the same excursion that truncates `RSP` carries a 64-bit
+return address through `R11` unharmed. This is specific to the stack pointer,
+not a general narrowing of the register file. Why it happens has not been
+traced; it is recorded here as measured behaviour.
+
+### The window, and why the alternate stack is permanent
+
+Between the outbound jump and that repair, `RSP` is unusable. A signal delivered
+inside the window would have the kernel build a frame at a truncated address —
+the same hazard, on a different edge, as the compatibility-mode signal finding
+above.
+
+The `MAP_32BIT` alternate stack installed for the recovery handlers closes it as
+a side effect: `SA_ONSTACK` means the frame never goes near `RSP`. What looked
+like scaffolding for a failing case turns out to be a permanent requirement of
+the design.
+
+### The negative control
+
+Each new assertion was checked by mutation, and each failed in the right place:
+
+| Mutation | Failures |
+| --- | --- |
+| `0x66` prefix → `NOP` | 5 of 5 round-trip tests |
+| drop `mov %r15, %rsp` | no-signal, and intact-`RSP` |
+| corrupt the landing immediate | 64-bit-decode only |
+
+The first is the one that matters: strip the operand-size prefix and the whole
+round trip collapses. The prefix is load-bearing, not decoration.
+
+### Consequence for the design
+
+Fault-and-recover-via-signal is no longer the only way out of 16-bit code, so
+the per-call cost of a host API is not bounded below by signal delivery. What
+that cost actually is has not been measured yet, and is the next experiment.

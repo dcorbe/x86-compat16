@@ -115,6 +115,66 @@ struct compat16_trap {
 int compat16_run_probe(int entry, void *segment_base, uint64_t seed,
                        struct compat16_trap *out);
 
+/*
+ * The value the landing pad's REX.W movabs leaves in R10 when it is decoded in
+ * 64-bit mode.
+ *
+ * The immediate's upper half is deliberately 0x90909090. Should the CPU somehow
+ * still be in compatibility mode when those bytes are reached, they decode
+ * instead as a one-byte DEC, a 32-bit MOV, and four NOPs -- a different answer,
+ * arrived at without faulting. A discriminator that crashes in the failing case
+ * tells you far less than one that returns the wrong number.
+ */
+#define COMPAT16_LANDING_MARK 0x90909090abcdef01ull
+
+/* What survives a 64 -> 16 -> 64 excursion made entirely by far jump. */
+struct compat16_roundtrip {
+    uint64_t rax;        /* RAX after the 16-bit leg; its decode evidence */
+    uint64_t r10;        /* the landing pad's 64-bit decode evidence */
+    uint64_t rsp_before; /* RSP before the outbound far jump */
+
+    /*
+     * RSP as it arrives at the landing pad, before the trampoline repairs it.
+     * Measured, and not what was expected: it comes back holding only the low
+     * 32 bits of the value it left with. See compat16.c.
+     */
+    uint64_t rsp_at_landing;
+
+    uint64_t rsp_after; /* RSP once back in compiler-generated 64-bit code */
+    uint16_t cs_before; /* the 64-bit CS we left from */
+    uint16_t cs_after;  /* CS after the return; equality is the claim */
+    int signo;          /* 0 when no signal was taken -- the whole point */
+};
+
+/*
+ * Far-jump into the 16-bit code segment in LDT slot `entry`, run a short probe
+ * there, and far-jump back into 64-bit mode without trapping.
+ *
+ * `segment_base` must be the same address the segment was installed over. It
+ * receives both stubs: the 16-bit probe at offset 0 and, further up the same
+ * page, a 64-bit landing pad. The landing pad is reached through the ordinary
+ * flat 64-bit CS, so the outbound jump names it by its linear address rather
+ * than by a segment offset -- which is why it, too, must live below 4 GiB.
+ *
+ * The return address itself is under no such limit. It travels in R11, which
+ * compatibility mode cannot name and therefore cannot disturb, so the landing
+ * pad can hand control back to a caller anywhere in the 64-bit address space.
+ * Only the trampoline is confined to the low 4 GiB.
+ *
+ * SS is never touched and the 16-bit leg pushes nothing, so it needs no stack
+ * of its own. RSP is a different matter: it does not survive the excursion
+ * whole, and the landing pad puts it back from a copy kept in R15. `rsp_before`
+ * and `rsp_at_landing` record the damage; `rsp_after` records the repair.
+ *
+ * Signal handlers are installed anyway, covering the case where the CPU or
+ * kernel declines the transition. Reaching one means the claim is false; `signo`
+ * then reports which signal ended it, instead of the test binary dying.
+ *
+ * Returns 0 on success. Returns -1 on failure to set up, with errno set.
+ */
+int compat16_run_roundtrip(int entry, void *segment_base, uint64_t seed,
+                           struct compat16_roundtrip *out);
+
 /* What a signal taken with a 16-bit stack segment does to RSP. */
 struct compat16_espfix {
     uint64_t rsp_before;    /* RSP in 64-bit mode, before the trap */
