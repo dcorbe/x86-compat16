@@ -458,7 +458,7 @@ while 16-bit `CS` *and* 16-bit `SS` are both live — which is the configuration
 the espfix64 finding never reached, and the one an asynchronous signal would
 find in any long-running 16-bit code — remains untested.
 
-## Finding: a signal from 16-bit code resumes cleanly, and this one was predicted
+## Finding: a signal from 16-bit code resumes cleanly, as predicted
 
 The configuration every other experiment here stops short of, and the one
 espfix64 exists for: `CS` **and** `SS` both 16-bit, a signal delivered, and
