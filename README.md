@@ -350,3 +350,38 @@ That is worth sitting with. Crossing from 64-bit code into a 16-bit segment and
 back is not an exotic expense to be engineered around; on this machine it is
 cheaper than asking the kernel for the current process ID. Whatever ends up
 limiting a module host, it will not be this.
+
+## Why this exists
+
+The BBS references above are not incidental. This work came out of building a
+Linux-native host for unmodified Galacticomm MajorBBS and Worldgroup modules,
+binaries from the early nineties whose 16-bit side is Phar Lap 286 protected
+mode. Running them means either emulating an x86 or persuading a real one to
+execute 16-bit protected-mode code, and the second option looked possible on
+paper. It is possible in practice, which is what this repo establishes.
+
+None of that is needed to read the results. The question — can a 64-bit Linux
+process execute 16-bit protected-mode code, and what does it cost — stands on
+its own, and so do the answers.
+
+## Scope
+
+This is a characterisation suite, and its scope is closed. It answers whether
+the machine in front of you permits these transitions and what they cost. It is
+not the execution layer of anything.
+
+That distinction is deliberate rather than aspirational. The code here uses
+file-scope statics throughout and is not reentrant; it is compiled `-O0` because
+several tests depend on exact register contents across a mode transition, and
+optimisation is free to keep those values somewhere the test cannot see. Both
+choices are right for a test and wrong for a runtime. A host wanting this
+capability should be written against the *findings* below, not grown from this
+code.
+
+What the suite is good for is staying honest. Kernels change, hardening options
+spread, and `CONFIG_X86_16BIT=n` is a legitimate and increasingly common build
+choice. Run `make test` and the machine tells you where it stands.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
