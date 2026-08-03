@@ -73,7 +73,15 @@ result worth having.
    `0x3`, not the `0x2` the request implies: Linux sets the accessed bit itself
    so the LDT page can be mapped read-only.
 
-8. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
+8. **`sixteen_bit_code_runs_on_a_16bit_stack_segment`**, with
+   **`the_stack16_leg_decoded_as_16bit_code`**,
+   **`push_and_pop_round_trip_on_a_16bit_stack`** and
+   **`a_far_call_and_ret_work_on_a_16bit_stack`** — the configuration real
+   16-bit code actually runs in. Loads a 16-bit `SS` from inside 16-bit mode,
+   pushes and pops, and far-calls a subroutine so that `CS:IP` goes on that
+   stack and `RETF` brings it back.
+
+9. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
    with a 16-bit `SS` loaded and see what happens to `RSP` across the
    `sigreturn`. This is a *characterisation* test: it records what the machine
    actually does and fires if that changes. The result contradicted the
@@ -171,11 +179,13 @@ fact.
 ### Next experiment
 
 Combine the two halves: 16-bit `CS` *and* 16-bit `SS`, then take a signal.
-Harder than it sounds, because the compatibility-mode signal finding below
-already shows delivery needs a `MAP_32BIT` alternate stack, and because
-resuming in 16-bit code after `sigreturn` needs its own way back out to
-64-bit — the probe above escapes by `siglongjmp`, which skips the `IRET` that
-is the entire subject of the experiment.
+
+Half of that is now done — 16-bit code **runs** on a 16-bit `SS`, see the
+finding below — but the half involving a signal is not, and it is the harder
+one. Delivery needs a `MAP_32BIT` alternate stack, and resuming in 16-bit code
+after `sigreturn` needs its own way back out to 64-bit: the probe above escapes
+by `siglongjmp`, which skips the `IRET` that is the entire subject of the
+experiment.
 
 ## Finding: you cannot take a signal on a 64-bit stack from compatibility mode
 
@@ -372,3 +382,76 @@ choice. Run `make test` and the machine tells you where it stands.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Finding: 16-bit code runs on a 16-bit stack, and nothing breaks
+
+Every excursion above avoids the stack on purpose. That is what lets them keep
+the flat 64-bit `SS` loaded throughout, and it is why the espfix64 hazard never
+came up. It is also nothing like real 16-bit code, which does little else:
+pushes arguments, makes far calls, keeps locals.
+
+So this one loads a 16-bit `SS` from *inside* 16-bit mode and uses it properly:
+
+```
+mov   $0x1234, %ax        # the usual operand-size discriminator
+mov   $SS, %bx
+mov   %bx, %ss            # interrupt shadow covers the next instruction
+mov   $0x1000, %sp
+pushw $0xface
+pop   %dx                 # DX == 0xface -> the stack works
+lcall $CS, $sub           # CS:IP goes on the 16-bit stack
+mov   %sp, %si            # SI == 0x1000 -> the stack is balanced
+ljmpl $CS64, $landing     # home
+sub:
+mov   $0xbeef, %cx        # CX == 0xbeef -> the subroutine ran
+lret
+```
+
+The `MOV SS` / `MOV SP` pairing is not stylistic. Loading `SS` inhibits
+interrupts for exactly one instruction, and that instruction is the window in
+which `SS` and `SP` disagree. Anything between them is a bug.
+
+**It all works.** No signal, `DX` comes back `0xface`, `CX` comes back `0xbeef`,
+`SI` comes back `0x1000`, and the caller's `SS` and `RSP` are both intact
+afterwards. The far call and `RETF` — the mechanism every 16-bit inter-segment
+call runs on — work fine on an LDT stack segment.
+
+### The stack pointer you get back is a mongrel
+
+    rsp at landing  0x000000000ccb1000
+    ss at landing   0x000f
+
+Read that value from the bottom up. The low 16 bits are `0x1000`, the `SP` the
+16-bit code set. Bits 16–31 are left over from the caller's original `RSP`,
+untouched because `MOV SP` writes 16 bits. The upper 32 are zero, from the
+truncation the previous finding describes.
+
+Three different provenances in one register. It is not a value anything should
+try to reconstruct, which is the practical argument for keeping the original in
+a register compatibility mode cannot reach and restoring from that. The landing
+pad puts `SS` back from `R13` and `RSP` from `R15`, in that order, so `MOV SS`'s
+interrupt shadow covers the instant when the two disagree.
+
+### The negative control
+
+| Mutation | Failures |
+| --- | --- |
+| never load the 16-bit `SS` | all four |
+| change the pushed word | push/pop only |
+| change the subroutine's marker | far call/ret only |
+| drop the subroutine's `LRET` | all four |
+
+The middle two are surgical, which is the useful evidence: those assertions are
+reading the values they claim to read, not passing because the excursion
+happened to complete.
+
+### What this does and does not establish
+
+It establishes that a 16-bit `SS` is usable as a stack, that far calls work on
+it, and that a 64-bit caller gets its own stack back unharmed.
+
+It does **not** establish anything about taking a signal in that state. This
+excursion completes without the kernel ever being involved. A signal arriving
+while 16-bit `CS` *and* 16-bit `SS` are both live — which is the configuration
+the espfix64 finding never reached, and the one an asynchronous signal would
+find in any long-running 16-bit code — remains untested.

@@ -633,6 +633,204 @@ int compat16_time_signal_path(int entry, void *segment_base,
 }
 
 /*
+ * The 16-bit stack stub, and where the 64-bit landing pad sits behind it.
+ *
+ * These bytes were produced by assembling the listing below with `as` and
+ * lifting the encoding out of `objdump`, rather than by working out ModRM by
+ * hand. At this length that is the difference between a stub that is right and
+ * one that merely looks right.
+ *
+ *      .code16
+ *   0: mov   $0x1234, %ax          b8 34 12    operand-size discriminator
+ *   3: mov   $SS, %bx              bb ss ss    16-bit stack selector, patched
+ *   6: mov   %bx, %ss              8e d3
+ *   8: mov   $0x1000, %sp          bc 00 10
+ *   b: pushw $0xface               68 ce fa
+ *   e: pop   %dx                   5a
+ *   f: lcall $CS, $0x1e            9a 1e 00 cs cs   selector patched
+ *  14: mov   %sp, %si              89 e6       SP at the end; balance check
+ *  16: ljmpl $CS64, $LANDING       66 ea <off32> <sel16>   both patched
+ *  1e: mov   $0xbeef, %cx          b9 ef be    the subroutine
+ *  21: lret                        cb
+ *
+ * MOV SS is immediately followed by the SP load. That ordering is not
+ * stylistic: loading SS inhibits interrupts for exactly one instruction, which
+ * is the window in which SS and SP disagree. Anything else between them is a
+ * bug.
+ *
+ * The LCALL's offset (0x1e) needs no patching because the stub is installed at
+ * offset 0 of its segment, so the subroutine's segment offset is its offset
+ * within this array. The selector does need patching -- a segment does not know
+ * its own selector.
+ */
+static unsigned char STACK16_CODE[] = {
+    0xb8, 0x34, 0x12,                                /* mov  $0x1234, %ax  */
+    0xbb, 0x00, 0x00,                                /* mov  $SS, %bx      */
+    0x8e, 0xd3,                                      /* mov  %bx, %ss      */
+    0xbc, 0x00, 0x10,                                /* mov  $0x1000, %sp  */
+    0x68, 0xce, 0xfa,                                /* pushw $0xface      */
+    0x5a,                                            /* pop  %dx           */
+    0x9a, 0x1e, 0x00, 0x00, 0x00,                    /* lcall $CS, $0x1e   */
+    0x89, 0xe6,                                      /* mov  %sp, %si      */
+    0x66, 0xea, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* ljmpl $CS64, $pad  */
+    0xb9, 0xef, 0xbe,                                /* mov  $0xbeef, %cx  */
+    0xcb,                                            /* lret               */
+};
+#define STACK16_STACK_SELECTOR_FIELD 4
+#define STACK16_CALL_SELECTOR_FIELD 18
+#define STACK16_JMP_OFFSET_FIELD 24
+#define STACK16_JMP_SELECTOR_FIELD 28
+
+/*
+ * The 64-bit landing pad for the stack excursion.
+ *
+ *      .code64
+ *   0: movabs $MARK, %r10          49 ba 01 ef cd ab 90 90 90 90
+ *  10: mov   %rax, (%r14)          49 89 06
+ *  13: mov   %rcx, 0x08(%r14)      49 89 4e 08
+ *  17: mov   %rdx, 0x10(%r14)      49 89 56 10
+ *  1b: mov   %rsi, 0x18(%r14)      49 89 76 18
+ *  1f: mov   %rsp, 0x20(%r14)      49 89 66 20
+ *  23: mov   %ss,  0x28(%r14)      41 8c 56 28
+ *  27: mov   %r13w, %ss            41 8e d5    restore the 64-bit SS
+ *  2a: mov   %r15, %rsp            4c 89 fc    and RSP, in the shadow
+ *  2d: jmp   *%r11                 41 ff e3
+ *
+ * The register spills happen while the 16-bit SS is still loaded, which is
+ * fine: they address memory through DS, and in 64-bit mode SS's base is ignored
+ * anyway. What they must not do is touch the stack, and they do not.
+ *
+ * SS is restored before RSP deliberately. MOV SS inhibits interrupts for one
+ * instruction, so the pair executes with no window in which a signal could
+ * arrive to find a 64-bit SS paired with a 16-bit stack pointer.
+ */
+static const unsigned char STACK16_LANDING[] = {
+    0x49, 0xba, 0x01, 0xef, 0xcd, 0xab, 0x90, 0x90, 0x90, 0x90,
+    0x49, 0x89, 0x06,
+    0x49, 0x89, 0x4e, 0x08,
+    0x49, 0x89, 0x56, 0x10,
+    0x49, 0x89, 0x76, 0x18,
+    0x49, 0x89, 0x66, 0x20,
+    0x41, 0x8c, 0x56, 0x28,
+    0x41, 0x8e, 0xd5,
+    0x4c, 0x89, 0xfc,
+    0x41, 0xff, 0xe3,
+};
+
+/*
+ * Slots the landing pad spills into, in the order its stores expect. Indices
+ * are byte offsets divided by eight; the pad hardcodes the byte offsets.
+ */
+enum {
+    STACK16_SLOT_RAX = 0,
+    STACK16_SLOT_RCX,
+    STACK16_SLOT_RDX,
+    STACK16_SLOT_RSI,
+    STACK16_SLOT_RSP,
+    STACK16_SLOT_SS,
+    STACK16_SLOT_COUNT,
+};
+
+static uint64_t stack16_slots[STACK16_SLOT_COUNT];
+static uint64_t stack16_rsp_before;
+static uint64_t stack16_rsp_after;
+static uint16_t stack16_ss_before;
+static uint16_t stack16_ss_after;
+
+int compat16_run_stack16(int code_entry, int stack_entry, void *code_base,
+                         void *stack_base, struct compat16_stack16 *out)
+{
+    static struct sigaction saved[PROBE_SIGNAL_COUNT];
+
+    (void)stack_base; /* named for symmetry; the descriptor already covers it */
+
+    unsigned char *page = code_base;
+    unsigned char *landing = page + ROUNDTRIP_LANDING_OFFSET;
+
+    if ((uintptr_t)landing > UINT32_MAX) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    uint16_t cs64;
+    __asm__ __volatile__("movw %%cs, %0" : "=r"(cs64));
+
+    uint16_t code_sel = COMPAT16_SELECTOR(code_entry);
+    uint16_t stack_sel = COMPAT16_SELECTOR(stack_entry);
+    uint32_t landing_linear = (uint32_t)(uintptr_t)landing;
+
+    memcpy(STACK16_CODE + STACK16_STACK_SELECTOR_FIELD, &stack_sel,
+           sizeof(stack_sel));
+    memcpy(STACK16_CODE + STACK16_CALL_SELECTOR_FIELD, &code_sel,
+           sizeof(code_sel));
+    memcpy(STACK16_CODE + STACK16_JMP_OFFSET_FIELD, &landing_linear,
+           sizeof(landing_linear));
+    memcpy(STACK16_CODE + STACK16_JMP_SELECTOR_FIELD, &cs64, sizeof(cs64));
+
+    memcpy(page, STACK16_CODE, sizeof(STACK16_CODE));
+    memcpy(landing, STACK16_LANDING, sizeof(STACK16_LANDING));
+
+    if (probe_altstack_install() != 0)
+        return -1;
+    if (probe_signals_install(saved) != 0)
+        return -1;
+
+    probe_signo = 0;
+    memset(stack16_slots, 0, sizeof(stack16_slots));
+    stack16_rsp_before = 0;
+    stack16_rsp_after = 0;
+    stack16_ss_before = 0;
+    stack16_ss_after = 0;
+
+    struct far_ptr target = {
+        .offset = 0,
+        .selector = code_sel,
+    };
+
+    if (sigsetjmp(probe_recovery, 1) == 0) {
+        /*
+         * R13 carries the 64-bit SS the landing pad has to put back. It joins
+         * R11, R14 and R15 in the set of registers compatibility mode cannot
+         * name and therefore cannot disturb.
+         */
+        __asm__ __volatile__(
+            "movq %%rsp, %[rsp_before]\n\t"
+            "movw %%ss, %[ss_before]\n\t"
+            "leaq 1f(%%rip), %%r11\n\t"
+            "xorl %%r13d, %%r13d\n\t"
+            "movw %%ss, %%r13w\n\t"
+            "movq %[slots], %%r14\n\t"
+            "movq %%rsp, %%r15\n\t"
+            "ljmpl *(%[target])\n"
+            "1:\n\t"
+            "movq %%rsp, %[rsp_after]\n\t"
+            "movw %%ss, %[ss_after]"
+            : [rsp_before] "=m"(stack16_rsp_before),
+              [rsp_after] "=m"(stack16_rsp_after),
+              [ss_before] "=m"(stack16_ss_before),
+              [ss_after] "=m"(stack16_ss_after)
+            : [target] "r"(&target), [slots] "r"(stack16_slots)
+            : "rax", "rcx", "rdx", "rsi", "r10", "r11", "r13", "r14", "r15",
+              "memory");
+    }
+
+    probe_signals_restore(saved);
+
+    out->rax = stack16_slots[STACK16_SLOT_RAX];
+    out->rcx = stack16_slots[STACK16_SLOT_RCX];
+    out->rdx = stack16_slots[STACK16_SLOT_RDX];
+    out->rbp = stack16_slots[STACK16_SLOT_RSI];
+    out->rsp_at_landing = stack16_slots[STACK16_SLOT_RSP];
+    out->ss_at_landing = stack16_slots[STACK16_SLOT_SS];
+    out->rsp_before = stack16_rsp_before;
+    out->rsp_after = stack16_rsp_after;
+    out->ss_before = stack16_ss_before;
+    out->ss_after = stack16_ss_after;
+    out->signo = (int)probe_signo;
+    return 0;
+}
+
+/*
  * espfix probe state. File scope is load-bearing, not stylistic: between the
  * IRET and the point where RSP is put back, there is no usable stack, so every
  * operand in that window has to be reachable RIP-relatively.

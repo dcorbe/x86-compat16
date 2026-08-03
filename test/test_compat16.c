@@ -331,6 +331,134 @@ TEST(the_far_jump_return_costs_far_less_than_a_signal)
 }
 
 /*
+ * Running 16-bit code on a 16-bit stack.
+ *
+ * Every excursion above deliberately avoided the stack. That is what let them
+ * keep the flat 64-bit `SS` loaded throughout, and it is why the espfix64
+ * hazard never came up. It is also nothing like real 16-bit code, which does
+ * little else: it pushes arguments, makes far calls, and keeps locals.
+ *
+ * So this one loads a 16-bit `SS` from inside 16-bit mode, sets `SP`, and
+ * exercises the stack properly -- a push/pop pair and a far call to a
+ * subroutine in the same segment, which pushes `CS:IP` and returns through it.
+ * Then back to 64-bit mode.
+ *
+ * These four tests share one excursion. Each names a separate thing that had to
+ * work for it to complete.
+ */
+TEST(sixteen_bit_code_runs_on_a_16bit_stack_segment)
+{
+    void *code = map_low_page();
+    void *stack = map_low_page();
+    ASSERT_MSG(code != NULL && stack != NULL,
+               "could not map pages below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, code, SEGMENT_BYTES), 0);
+    ASSERT_EQ_INT(compat16_install_stack_segment(TEST_LDT_STACK_ENTRY, stack,
+                                                 SEGMENT_BYTES),
+                  0);
+
+    struct compat16_stack16 run = {0};
+    ASSERT_EQ_INT(compat16_run_stack16(TEST_LDT_ENTRY, TEST_LDT_STACK_ENTRY,
+                                       code, stack, &run),
+                  0);
+
+    printf("        rsp at landing  %#018llx\n",
+           (unsigned long long)run.rsp_at_landing);
+    printf("        ss at landing   %#06llx\n",
+           (unsigned long long)run.ss_at_landing);
+
+    ASSERT_MSG(run.signo == 0, "expected no signal, got signal %d", run.signo);
+
+    /* The 16-bit stack really was loaded, so nothing passes vacuously. */
+    ASSERT_EQ_INT(run.ss_at_landing, COMPAT16_SELECTOR(TEST_LDT_STACK_ENTRY));
+
+    /* And the caller's stack came back untouched, selector and pointer both. */
+    ASSERT_EQ_INT(run.ss_after, run.ss_before);
+    ASSERT_EQ_U64(run.rsp_after, run.rsp_before);
+}
+
+/*
+ * The 16-bit leg still has to have been 16-bit. Same discriminator as
+ * everywhere else: `mov ax, 0x1234` touches AX alone, so a 32-bit misdecode
+ * cannot produce this value.
+ */
+TEST(the_stack16_leg_decoded_as_16bit_code)
+{
+    void *code = map_low_page();
+    void *stack = map_low_page();
+    ASSERT_MSG(code != NULL && stack != NULL,
+               "could not map pages below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, code, SEGMENT_BYTES), 0);
+    ASSERT_EQ_INT(compat16_install_stack_segment(TEST_LDT_STACK_ENTRY, stack,
+                                                 SEGMENT_BYTES),
+                  0);
+
+    struct compat16_stack16 run = {0};
+    ASSERT_EQ_INT(compat16_run_stack16(TEST_LDT_ENTRY, TEST_LDT_STACK_ENTRY,
+                                       code, stack, &run),
+                  0);
+
+    ASSERT_EQ_U64(run.rax & 0xffffu, 0x1234u);
+}
+
+/*
+ * Push a word, pop it back. The simplest possible statement that a 16-bit
+ * stack segment is usable as a stack and not merely loadable as a selector.
+ */
+TEST(push_and_pop_round_trip_on_a_16bit_stack)
+{
+    void *code = map_low_page();
+    void *stack = map_low_page();
+    ASSERT_MSG(code != NULL && stack != NULL,
+               "could not map pages below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, code, SEGMENT_BYTES), 0);
+    ASSERT_EQ_INT(compat16_install_stack_segment(TEST_LDT_STACK_ENTRY, stack,
+                                                 SEGMENT_BYTES),
+                  0);
+
+    struct compat16_stack16 run = {0};
+    ASSERT_EQ_INT(compat16_run_stack16(TEST_LDT_ENTRY, TEST_LDT_STACK_ENTRY,
+                                       code, stack, &run),
+                  0);
+
+    ASSERT_EQ_U64(run.rdx & 0xffffu, COMPAT16_STACK16_PUSHED);
+}
+
+/*
+ * The one that matters most.
+ *
+ * A far call pushes `CS:IP` and `RETF` pops it, which is the mechanism every
+ * 16-bit call between segments runs on. If this works on an LDT stack segment,
+ * so does calling out of 16-bit code and returning to it.
+ */
+TEST(a_far_call_and_ret_work_on_a_16bit_stack)
+{
+    void *code = map_low_page();
+    void *stack = map_low_page();
+    ASSERT_MSG(code != NULL && stack != NULL,
+               "could not map pages below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, code, SEGMENT_BYTES), 0);
+    ASSERT_EQ_INT(compat16_install_stack_segment(TEST_LDT_STACK_ENTRY, stack,
+                                                 SEGMENT_BYTES),
+                  0);
+
+    struct compat16_stack16 run = {0};
+    ASSERT_EQ_INT(compat16_run_stack16(TEST_LDT_ENTRY, TEST_LDT_STACK_ENTRY,
+                                       code, stack, &run),
+                  0);
+
+    /* The subroutine ran... */
+    ASSERT_EQ_U64(run.rcx & 0xffffu, COMPAT16_STACK16_CALL_MARK);
+
+    /* ...and returned leaving SP exactly where it started, nothing leaked. */
+    ASSERT_EQ_U64(run.rbp & 0xffffu, COMPAT16_STACK16_INITIAL_SP);
+}
+
+/*
  * The espfix64 hazard needs a 16-bit *stack* segment, which is a different
  * descriptor from the code one: writable data, and the cleared bit is B rather
  * than D. Gate the probe on the kernel accepting it.
@@ -409,6 +537,10 @@ int main(void)
     RUN_TEST(rsp_arrives_at_the_landing_pad_truncated_to_32_bits);
     RUN_TEST(the_landing_pad_hands_back_an_intact_rsp);
     RUN_TEST(the_far_jump_return_costs_far_less_than_a_signal);
+    RUN_TEST(sixteen_bit_code_runs_on_a_16bit_stack_segment);
+    RUN_TEST(the_stack16_leg_decoded_as_16bit_code);
+    RUN_TEST(push_and_pop_round_trip_on_a_16bit_stack);
+    RUN_TEST(a_far_call_and_ret_work_on_a_16bit_stack);
     RUN_TEST(kernel_accepts_a_16bit_stack_descriptor);
     RUN_TEST(rsp_survives_a_signal_taken_on_a_16bit_stack_segment);
     return harness_report();

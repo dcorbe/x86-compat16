@@ -209,6 +209,60 @@ int compat16_time_roundtrip(int entry, void *segment_base, uint64_t iterations,
 int compat16_time_signal_path(int entry, void *segment_base,
                               uint64_t iterations, uint64_t *out_ns);
 
+/*
+ * Values the 16-bit stack stub plants, so the tests can name them rather than
+ * matching bare magic numbers against a byte array.
+ */
+#define COMPAT16_STACK16_PUSHED 0xfaceu     /* pushed, then popped into DX */
+#define COMPAT16_STACK16_CALL_MARK 0xbeefu  /* set into CX by the subroutine */
+#define COMPAT16_STACK16_INITIAL_SP 0x1000u /* SP on entry; top of segment */
+
+/* What 16-bit code leaves behind after running on a 16-bit stack segment. */
+struct compat16_stack16 {
+    uint64_t rax; /* 0x1234 in AX: the operand-size discriminator */
+    uint64_t rcx; /* COMPAT16_STACK16_CALL_MARK, if the subroutine ran */
+    uint64_t rdx; /* what POP recovered */
+    uint64_t rbp; /* SP at the end of the 16-bit leg; the balance check */
+
+    uint64_t rsp_at_landing; /* RSP on arrival, before the trampoline repairs */
+    uint64_t ss_at_landing;  /* SS on arrival: proves which stack was live */
+
+    uint64_t rsp_before; /* the caller's RSP and SS, before and after, which */
+    uint64_t rsp_after;  /* must match for the excursion to be usable at all */
+    uint16_t ss_before;
+    uint16_t ss_after;
+
+    int signo; /* 0 when no signal was taken */
+};
+
+/*
+ * Run 16-bit code on a 16-bit stack segment, and come back.
+ *
+ * Everything else here deliberately avoids the stack, which is what lets those
+ * excursions keep the flat 64-bit SS loaded throughout. Real 16-bit code does
+ * nothing else: it pushes arguments, makes far calls, and keeps locals. This is
+ * the configuration that actually matters, and the one the espfix64 finding
+ * never reached.
+ *
+ * The stub loads SS from inside 16-bit mode -- MOV SS is followed immediately
+ * by the SP load, which the interrupt shadow makes atomic -- then pushes and
+ * pops a word, and far-calls a subroutine in its own segment so that CS:IP goes
+ * on the 16-bit stack and RETF brings it back. That last part is the mechanism
+ * every 16-bit inter-segment call runs on.
+ *
+ *   code_entry, code_base    LDT slot and page of the 16-bit code segment
+ *   stack_entry, stack_base  LDT slot and page of the 16-bit stack segment
+ *
+ * Both pages must be below 4 GiB, and both descriptors must already be
+ * installed. The landing pad restores SS from R13 and RSP from R15 before
+ * returning, in that order: MOV SS's interrupt shadow covers the instant when
+ * the two disagree.
+ *
+ * Returns 0 on success. Returns -1 with errno set on failure to set up.
+ */
+int compat16_run_stack16(int code_entry, int stack_entry, void *code_base,
+                         void *stack_base, struct compat16_stack16 *out);
+
 /* What a signal taken with a 16-bit stack segment does to RSP. */
 struct compat16_espfix {
     uint64_t rsp_before;    /* RSP in 64-bit mode, before the trap */
