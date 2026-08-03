@@ -12,6 +12,8 @@
 #include <sys/syscall.h>
 #include <sys/ucontext.h>
 #include <time.h>
+#include <stdio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "compat16.h"
@@ -146,6 +148,9 @@ static volatile uint64_t probe_rax;
  *              wrong value instead of running off into the page and dying
  *              somewhere unhelpful.
  */
+/* Seed for the forked probe. Its value does not matter, only that it runs. */
+#define PROBE_CHILD_SEED 0x0123456789abcdefull
+
 static const unsigned char PROBE_CODE[] = {
     0xb8, 0x34, 0x12, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
 };
@@ -168,17 +173,11 @@ static void probe_trap_handler(int signo, siginfo_t *info, void *ctx)
 }
 
 /*
- * Point signal delivery at an alternate stack below 4 GiB.
+ * Arrange -- or deliberately fail to arrange -- an alternate signal stack.
  *
- * The signal frame MUST live below 4 GiB, and this is not optional.
- *
- * Measured behaviour on Linux 6.18: when the trap is taken while the CPU is in
- * compatibility mode, the kernel cannot place a signal frame on the process's
- * ordinary stack, which on x86-64 sits far above 4 GiB. Frame setup fails, the
- * kernel calls force_sigsegv(), that delivery fails the same way, and the
- * process dies from an unhandled SIGSEGV -- with a SIGSEGV handler installed
- * and CONFIG_IA32_EMULATION=y.
- *
+ * Taking a signal in compatibility mode without one is fatal. The kernel cannot
+ * build a frame, calls force_sigsegv(), fails the same way again, and the
+ * process dies with a SIGSEGV handler installed and CONFIG_IA32_EMULATION=y.
  * strace shows the shape of it plainly:
  *
  *     --- SIGTRAP  {si_code=SI_KERNEL} ---     <- our int3 fired
@@ -186,31 +185,47 @@ static void probe_trap_handler(int signo, siginfo_t *info, void *ctx)
  *     --- SIGSEGV  {si_code=SI_KERNEL} ---     <- and again
  *     +++ killed by SIGSEGV +++
  *
- * Redirecting the frame to a MAP_32BIT alternate stack fixes it, which is what
- * establishes the address range as the cause. That the frame must be
- * addressable within 32 bits is the observed rule; the precise kernel path that
- * enforces it has not been traced here.
- *
- * This is the same family of hazard as espfix64: a 64-bit stack pointer meeting
- * a stack discipline that only has 32 bits to say it in.
+ * The three modes exist so that the fix can be taken apart. An earlier version
+ * of this file changed two things at once -- it added an alternate stack AND
+ * mapped it below 4 GiB -- and credited the low mapping. COMPAT16_ALTSTACK_HIGH
+ * is what separates them.
  *
  * Returns 0 on success, -1 with errno set on failure.
  */
-static int probe_altstack_install(void)
+static int probe_altstack_install(enum compat16_altstack which)
 {
-    static char *altstack;
+    static char *low;
+    static char *high;
 
-    if (altstack == NULL) {
-        altstack = mmap(NULL, 65536, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
-        if (altstack == MAP_FAILED) {
-            altstack = NULL;
-            return -1;
-        }
+    if (which == COMPAT16_ALTSTACK_NONE) {
+        stack_t off = {.ss_sp = NULL, .ss_size = 0, .ss_flags = SS_DISABLE};
+        return sigaltstack(&off, NULL);
     }
 
-    stack_t alt = {.ss_sp = altstack, .ss_size = 65536, .ss_flags = 0};
+    char **slot = (which == COMPAT16_ALTSTACK_LOW) ? &low : &high;
+    int extra = (which == COMPAT16_ALTSTACK_LOW) ? MAP_32BIT : 0;
+
+    if (*slot == NULL) {
+        char *p = mmap(NULL, 65536, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | extra, -1, 0);
+        if (p == MAP_FAILED)
+            return -1;
+        *slot = p;
+    }
+
+    stack_t alt = {.ss_sp = *slot, .ss_size = 65536, .ss_flags = 0};
     return sigaltstack(&alt, NULL);
+}
+
+/* Where an installed alternate stack actually landed, for the tests to show. */
+uintptr_t compat16_altstack_address(enum compat16_altstack which)
+{
+    stack_t current;
+
+    (void)which;
+    if (sigaltstack(NULL, &current) != 0)
+        return 0;
+    return (uintptr_t)current.ss_sp;
 }
 
 /*
@@ -255,8 +270,20 @@ static void probe_signals_restore(const struct sigaction *saved)
         sigaction(PROBE_SIGNALS[i], &saved[i], NULL);
 }
 
+static int run_probe_with(int entry, void *segment_base, uint64_t seed,
+                          enum compat16_altstack altstack,
+                          struct compat16_trap *out);
+
 int compat16_run_probe(int entry, void *segment_base, uint64_t seed,
                        struct compat16_trap *out)
+{
+    return run_probe_with(entry, segment_base, seed, COMPAT16_ALTSTACK_LOW,
+                          out);
+}
+
+static int run_probe_with(int entry, void *segment_base, uint64_t seed,
+                          enum compat16_altstack altstack,
+                          struct compat16_trap *out)
 {
     /*
      * Saved handlers are static rather than automatic: an automatic object
@@ -268,7 +295,7 @@ int compat16_run_probe(int entry, void *segment_base, uint64_t seed,
 
     memcpy(segment_base, PROBE_CODE, sizeof(PROBE_CODE));
 
-    if (probe_altstack_install() != 0)
+    if (probe_altstack_install(altstack) != 0)
         return -1;
     if (probe_signals_install(saved) != 0)
         return -1;
@@ -499,7 +526,7 @@ int compat16_run_roundtrip(int entry, void *segment_base, uint64_t seed,
     if (cs64 == 0)
         return -1;
 
-    if (probe_altstack_install() != 0)
+    if (probe_altstack_install(COMPAT16_ALTSTACK_LOW) != 0)
         return -1;
     if (probe_signals_install(saved) != 0)
         return -1;
@@ -556,7 +583,7 @@ int compat16_time_roundtrip(int entry, void *segment_base, uint64_t iterations,
 
     if (roundtrip_stubs_install(segment_base) == 0)
         return -1;
-    if (probe_altstack_install() != 0)
+    if (probe_altstack_install(COMPAT16_ALTSTACK_LOW) != 0)
         return -1;
     if (probe_signals_install(saved) != 0)
         return -1;
@@ -616,7 +643,7 @@ int compat16_time_signal_path(int entry, void *segment_base,
 
     memcpy(segment_base, PROBE_CODE, sizeof(PROBE_CODE));
 
-    if (probe_altstack_install() != 0)
+    if (probe_altstack_install(COMPAT16_ALTSTACK_LOW) != 0)
         return -1;
     if (probe_signals_install(saved) != 0)
         return -1;
@@ -778,7 +805,7 @@ int compat16_run_stack16(int code_entry, int stack_entry, void *code_base,
     memcpy(page, STACK16_CODE, sizeof(STACK16_CODE));
     memcpy(landing, STACK16_LANDING, sizeof(STACK16_LANDING));
 
-    if (probe_altstack_install() != 0)
+    if (probe_altstack_install(COMPAT16_ALTSTACK_LOW) != 0)
         return -1;
     if (probe_signals_install(saved) != 0)
         return -1;
@@ -951,7 +978,7 @@ int compat16_run_sigret(int code_entry, int stack_entry, void *code_base,
     memcpy(page, SIGRET_CODE, sizeof(SIGRET_CODE));
     memcpy(landing, STACK16_LANDING, sizeof(STACK16_LANDING));
 
-    if (probe_altstack_install() != 0)
+    if (probe_altstack_install(COMPAT16_ALTSTACK_LOW) != 0)
         return -1;
     if (probe_signals_install_handler(saved, sigret_handler) != 0)
         return -1;
@@ -1103,7 +1130,7 @@ int compat16_run_reentry(int code_entry, int stack_entry, void *code_base,
     memcpy(page + REENTRY_THUNK_OFFSET, REENTRY_THUNK, sizeof(REENTRY_THUNK));
     memcpy(landing, STACK16_LANDING, sizeof(STACK16_LANDING));
 
-    if (probe_altstack_install() != 0)
+    if (probe_altstack_install(COMPAT16_ALTSTACK_LOW) != 0)
         return -1;
     if (probe_signals_install(saved) != 0)
         return -1;
@@ -1285,5 +1312,48 @@ int compat16_probe_espfix(int stack_entry, struct compat16_espfix *out)
     out->rsp_after = espfix_rsp_after;
     out->ss_saved = espfix_frame_ss;
     out->ss_in_handler = espfix_live_ss;
+    return 0;
+}
+
+/*
+ * Run the one-way probe in a child process.
+ *
+ * The suite forks nowhere else, and harness.h explains why: a framework that
+ * forked around every test would interfere with the very transitions under
+ * test. This one is different, because the outcome being measured may be *the
+ * death of the process*. Containing that in a child is the only way to report
+ * it as a result rather than suffer it as one.
+ *
+ * The child exits 0 if the probe trapped as designed, 1 if it came back some
+ * other way, and 2 if it could not be set up. _exit() rather than exit(), so
+ * that no atexit handler or stdio buffer belonging to the parent runs twice.
+ *
+ * Returns 0 on success, -1 with errno set if the fork or the wait failed.
+ */
+int compat16_probe_in_child(int entry, void *segment_base,
+                            enum compat16_altstack altstack,
+                            struct compat16_child *out)
+{
+    fflush(NULL); /* nothing already buffered should be written twice */
+
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+
+    if (pid == 0) {
+        struct compat16_trap trap = {0};
+        if (run_probe_with(entry, segment_base, PROBE_CHILD_SEED, altstack,
+                           &trap) != 0)
+            _exit(2);
+        _exit(trap.signo == SIGTRAP ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+        return -1;
+
+    out->exited = WIFEXITED(status) ? 1 : 0;
+    out->status = out->exited ? WEXITSTATUS(status) : 0;
+    out->signo = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
     return 0;
 }

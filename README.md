@@ -91,7 +91,13 @@ result worth having.
    for: `CS` and `SS` both 16-bit when the signal lands. The handler *returns*
    rather than escaping, so that `sigreturn`'s `IRET` is the thing on trial.
 
-11. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
+11. **`without_an_alternate_stack_a_compatibility_mode_signal_is_fatal`** and
+    **`an_alternate_stack_above_4gib_is_enough`** — the fix for
+    compatibility-mode signal delivery, taken apart. Both run in a forked child,
+    because what they measure is whether the process survives. They corrected a
+    claim this file used to make; see below.
+
+12. **`rsp_survives_a_signal_taken_on_a_16bit_stack_segment`** — take a signal
    with a 16-bit `SS` loaded and see what happens to `RSP` across the
    `sigreturn`. This is a *characterisation* test: it records what the machine
    actually does and fires if that changes. The result contradicted the
@@ -212,18 +218,41 @@ That doubled kernel-generated `SIGSEGV` is the signature of `force_sigsegv()`:
 the kernel could not build a signal frame, tried to report *that* as a fault,
 and could not build a frame for it either.
 
-The cause is the frame's address. An ordinary x86-64 stack lives far above
-4 GiB, and while the CPU is in compatibility mode the kernel cannot place a
-frame there. Pointing the signal at a `MAP_32BIT` alternate stack — one
-variable changed — makes delivery work. That is the evidence; the exact kernel
-path enforcing it was not traced.
+Pointing the signal at a `MAP_32BIT` alternate stack makes delivery work.
 
-It is the same family of hazard as espfix64: a 64-bit stack pointer meeting a
-stack discipline with only 32 bits to express it.
+### That fix changed two things at once, and this file blamed the wrong one
 
-**Consequence for the design:** fault-and-recover-via-signal is a valid way
-back out of 16-bit code, but *only* with a low alternate stack. Without one it
-is not merely unreliable, it is fatal.
+The sentence that used to sit here said the cause was the frame's *address* —
+that an ordinary x86-64 stack lives above 4 GiB and the kernel cannot build a
+frame there while the CPU is in compatibility mode. It called that "one variable
+changed". It was two: the fix introduced an alternate stack **and** mapped it
+low, and the low mapping was given the credit for both.
+
+Separating them needs a third arm, and all three have to be able to end in the
+process dying, so they run in a forked child. That is the only fork in this
+suite; `harness.h` explains why there are otherwise none.
+
+    none: exited 0 status 0 signal 11
+    high: exited 1 status 0 signal 0
+    low:  exited 1 status 0 signal 0
+
+With no alternate stack the child is killed by `SIGSEGV`, which is the original
+failure reproduced as a test rather than recalled as an anecdote. With an
+alternate stack the child survives and the probe traps exactly as designed —
+**whether or not that stack is below 4 GiB**.
+
+So the rule is `SA_ONSTACK`. The address is incidental.
+
+That reading also makes better mechanical sense. With an alternate stack the
+kernel builds the frame at a place it already knows. Without one it has to
+derive the address from `RSP`, and `RSP` in compatibility mode has been
+truncated to 32 bits and re-based by whatever `SS` is loaded — so the address it
+computes is not a stack at all. The trouble was never the height of the stack;
+it was that the pointer to it had stopped meaning anything.
+
+**Consequence for the design:** fault-and-recover-via-signal is a valid way back
+out of 16-bit code, but *only* with `SA_ONSTACK`. Without it this is not merely
+unreliable, it is fatal. Where that stack lives is a free choice.
 
 ## Finding: the round trip needs no signal, and three bytes of stack repair
 
@@ -300,10 +329,10 @@ inside the window would have the kernel build a frame at a truncated address —
 the same hazard, on a different edge, as the compatibility-mode signal finding
 above.
 
-The `MAP_32BIT` alternate stack installed for the recovery handlers closes it as
-a side effect: `SA_ONSTACK` means the frame never goes near `RSP`. What looked
-like scaffolding for a failing case turns out to be a permanent requirement of
-the design.
+The alternate stack installed for the recovery handlers closes it as a side
+effect: `SA_ONSTACK` means the frame never goes near `RSP`. What looked like
+scaffolding for a failing case turns out to be a permanent requirement of the
+design.
 
 ### The negative control
 
@@ -537,8 +566,8 @@ is the mechanism, isolated.
 ### What this retires
 
 Asynchronous signals arriving in 16-bit code are survivable. Delivery works with
-the `MAP_32BIT` alternate stack, and resumption works because `sigreturn`
-restores a valid 16-bit `SS`.
+the alternate stack, and resumption works because `sigreturn` restores a valid
+16-bit `SS`.
 
 Two caveats. The trap here is synchronous (`INT3`), so it arrives at a known
 instruction boundary; a genuinely asynchronous signal arrives anywhere, and the

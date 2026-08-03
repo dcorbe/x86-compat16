@@ -4,6 +4,7 @@
  *
  * See README.md for the claim under test.
  */
+#include <signal.h>
 #include <sys/mman.h>
 
 #include "compat16.h"
@@ -692,7 +693,80 @@ TEST(sixteen_bit_code_resumes_at_a_recovered_cs_ip)
     ASSERT_EQ_U64(run.rsp_after, run.rsp_before);
 }
 
+/*
+ * Taking the signal-delivery fix apart.
+ *
+ * The finding below used to say the alternate signal stack had to live below
+ * 4 GiB. That conclusion came from an experiment that changed two things at
+ * once: it added an alternate stack *and* mapped it low. Only one of those can
+ * be the cause, and this pair of tests says which.
+ *
+ * These run in a forked child, which the rest of the suite never does. The
+ * outcome being measured is whether the process survives, and there is no way
+ * to report that from inside the process it happens to.
+ */
+TEST(without_an_alternate_stack_a_compatibility_mode_signal_is_fatal)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    struct compat16_child child = {0};
+    ASSERT_EQ_INT(compat16_probe_in_child(TEST_LDT_ENTRY, page,
+                                          COMPAT16_ALTSTACK_NONE, &child),
+                  0);
+
+    printf("        none: exited %d status %d signal %d\n", child.exited,
+           child.status, child.signo);
+
+    /* The control. Without SA_ONSTACK the child does not come back at all. */
+    ASSERT_MSG(child.exited == 0, "expected the child to be killed, it exited");
+    ASSERT_EQ_INT(child.signo, SIGSEGV);
+}
+
+/*
+ * And the isolation: an alternate stack, deliberately NOT below 4 GiB.
+ *
+ * If the address were the cause, this would die exactly as the test above
+ * does. It does not.
+ */
+TEST(an_alternate_stack_above_4gib_is_enough)
+{
+    void *page = map_low_page();
+    ASSERT_MSG(page != NULL, "could not map a page below 4 GiB");
+    ASSERT_EQ_INT(
+        compat16_install_code_segment(TEST_LDT_ENTRY, page, SEGMENT_BYTES), 0);
+
+    struct compat16_child high = {0};
+    ASSERT_EQ_INT(compat16_probe_in_child(TEST_LDT_ENTRY, page,
+                                          COMPAT16_ALTSTACK_HIGH, &high),
+                  0);
+
+    struct compat16_child low = {0};
+    ASSERT_EQ_INT(compat16_probe_in_child(TEST_LDT_ENTRY, page,
+                                          COMPAT16_ALTSTACK_LOW, &low),
+                  0);
+
+    printf("        high: exited %d status %d signal %d\n", high.exited,
+           high.status, high.signo);
+    printf("        low:  exited %d status %d signal %d\n", low.exited,
+           low.status, low.signo);
+
+    /* Both survive, and both take the trap they were supposed to take. */
+    ASSERT_MSG(high.exited != 0, "child with a high alternate stack was killed "
+                                 "by signal %d",
+               high.signo);
+    ASSERT_EQ_INT(high.status, 0);
+
+    ASSERT_MSG(low.exited != 0, "child with a low alternate stack was killed "
+                               "by signal %d",
+               low.signo);
+    ASSERT_EQ_INT(low.status, 0);
+}
+
 int main(void)
+
 {
     /*
      * Line buffering, so that partial results survive a crash. Earlier
@@ -728,5 +802,13 @@ int main(void)
     RUN_TEST(sixteen_bit_code_resumes_at_a_recovered_cs_ip);
     RUN_TEST(a_signal_can_be_taken_and_resumed_from_16bit_code);
     RUN_TEST(sigreturn_restores_the_16bit_stack);
+
+    /*
+     * These fork. They are last because the thing they measure is whether a
+     * process survives at all, and because forking anywhere near the other
+     * transitions would muddy them.
+     */
+    RUN_TEST(without_an_alternate_stack_a_compatibility_mode_signal_is_fatal);
+    RUN_TEST(an_alternate_stack_above_4gib_is_enough);
     return harness_report();
 }

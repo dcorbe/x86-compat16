@@ -88,6 +88,47 @@ int compat16_read_descriptor(int entry, uint64_t *out_raw);
  */
 int compat16_install_stack_segment(int entry, const void *base, size_t length);
 
+/*
+ * Where a probe's alternate signal stack lives, if anywhere.
+ *
+ * These exist so the fix for the compatibility-mode signal problem can be taken
+ * apart. Adding an alternate stack and mapping it below 4 GiB were originally
+ * done together and the low mapping was credited with the result; HIGH is what
+ * separates the two.
+ */
+enum compat16_altstack {
+    COMPAT16_ALTSTACK_LOW,  /* MAP_32BIT: below 4 GiB */
+    COMPAT16_ALTSTACK_HIGH, /* an ordinary mapping, wherever it lands */
+    COMPAT16_ALTSTACK_NONE, /* none at all: SS_DISABLE */
+};
+
+/* Where the alternate stack currently installed on this thread begins. */
+uintptr_t compat16_altstack_address(enum compat16_altstack which);
+
+/* How a forked probe ended. */
+struct compat16_child {
+    int exited; /* nonzero if it returned normally rather than being killed */
+    int status; /* its exit status, when it exited */
+    int signo;  /* the signal that killed it, otherwise */
+};
+
+/*
+ * Run the one-way probe in a child process with the given alternate stack
+ * arrangement, and report how the child ended.
+ *
+ * Forking is not this suite's habit -- see harness.h. It is warranted here
+ * because the outcome being measured may be the death of the process, and a
+ * child is the only way to report that rather than suffer it.
+ *
+ * The child exits 0 if the probe trapped as designed, 1 if it returned some
+ * other way, and 2 if it could not be set up.
+ *
+ * Returns 0 on success, -1 with errno set if the fork or the wait failed.
+ */
+int compat16_probe_in_child(int entry, void *segment_base,
+                            enum compat16_altstack altstack,
+                            struct compat16_child *out);
+
 /* CPU state captured at the instant the 16-bit probe trapped. */
 struct compat16_trap {
     uint64_t rax; /* RAX at fault time; proves how the probe was decoded */
@@ -107,8 +148,9 @@ struct compat16_trap {
  * in 64-bit mode recovers via siglongjmp. The signal frame is a useful bonus:
  * it carries the register state at fault time, including CS.
  *
- * Recovering this way requires an alternate signal stack below 4 GiB. That is
- * not a detail -- without it the process dies. See the comment in compat16.c.
+ * Recovering this way requires an alternate signal stack. That is not a detail
+ * -- without one the process dies. Its address, however, does not matter; see
+ * README.md, where the opposite used to be claimed.
  *
  * Returns 0 on success. Returns -1 on failure to set up, with errno set.
  */
